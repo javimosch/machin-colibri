@@ -1,0 +1,344 @@
+// colibri — pure-MFL LLM inference engine (M0: fp32 llama2.c-format forward pass)
+// Clean-room, zero deps beyond machin builtins. Weights live in raw alloc'd
+// buffers accessed with peek_f32/poke_f32 so storage stays fp32 like llama2.c.
+
+// ---- config (from checkpoint header) ----
+var dim = 0
+var hidden_dim = 0
+var n_layers = 0
+var n_heads = 0
+var n_kv_heads = 0
+var vocab_size = 0
+var seq_len = 0
+var head_size = 0
+var kv_dim = 0
+
+// ---- weight byte-offsets into the checkpoint buffer ----
+var wbuf = 0
+var w_tok_emb = 0
+var w_rms_att = 0
+var w_q = 0
+var w_k = 0
+var w_v = 0
+var w_o = 0
+var w_rms_ffn = 0
+var w_1 = 0
+var w_2 = 0
+var w_3 = 0
+var w_rms_final = 0
+var w_cls = 0
+
+// ---- run state (alloc'd fp32 buffers) ----
+var s_x = 0
+var s_xb = 0
+var s_xb2 = 0
+var s_hb = 0
+var s_hb2 = 0
+var s_q = 0
+var s_att = 0
+var s_logits = 0
+var s_key_cache = 0
+var s_val_cache = 0
+
+// ---- tokenizer ----
+var vocab = []string{}
+
+func read_i32(b, off) (v) {
+	v = byte_at(b, off) | byte_at(b, off+1) << 8 | byte_at(b, off+2) << 16 | byte_at(b, off+3) << 24
+	if v >= 2147483648 { v = v - 4294967296 }
+	return
+}
+
+// copy a bytes value into a fresh raw buffer (weights load path)
+func bytes_to_buf(b) (p) {
+	n := len(b)
+	p = alloc(n)
+	i := 0
+	while i < n {
+		w := byte_at(b, i) | byte_at(b, i+1) << 8 | byte_at(b, i+2) << 16 | byte_at(b, i+3) << 24
+		poke_i32(p, i, w)
+		i = i + 4
+	}
+	return
+}
+
+func load_model(path) {
+	b := read_file_bytes(path)
+	if len(b) == 0 { println("cannot read model: " + path)  exit(1) }
+	dim = read_i32(b, 0)
+	hidden_dim = read_i32(b, 4)
+	n_layers = read_i32(b, 8)
+	n_heads = read_i32(b, 12)
+	n_kv_heads = read_i32(b, 16)
+	vocab_size = read_i32(b, 20)
+	seq_len = read_i32(b, 24)
+	shared := 1
+	if vocab_size < 0 { shared = 0  vocab_size = 0 - vocab_size }
+	head_size = dim / n_heads
+	kv_dim = (dim * n_kv_heads) / n_heads
+	wbuf = bytes_to_buf(b)
+	// weight offsets, in bytes (each weight is fp32 = 4 bytes)
+	o := 28
+	w_tok_emb = o   o = o + vocab_size * dim * 4
+	w_rms_att = o   o = o + n_layers * dim * 4
+	w_q = o         o = o + n_layers * dim * n_heads * head_size * 4
+	w_k = o         o = o + n_layers * dim * n_kv_heads * head_size * 4
+	w_v = o         o = o + n_layers * dim * n_kv_heads * head_size * 4
+	w_o = o         o = o + n_layers * n_heads * head_size * dim * 4
+	w_rms_ffn = o   o = o + n_layers * dim * 4
+	w_1 = o         o = o + n_layers * dim * hidden_dim * 4
+	w_2 = o         o = o + n_layers * hidden_dim * dim * 4
+	w_3 = o         o = o + n_layers * dim * hidden_dim * 4
+	w_rms_final = o o = o + dim * 4
+	o = o + seq_len * head_size * 4 // skip legacy freq_cis_real + imag (2 * seq_len * head_size/2)
+	if shared == 1 { w_cls = w_tok_emb } else { w_cls = o }
+}
+
+func alloc_state() {
+	s_x = alloc(dim * 4)
+	s_xb = alloc(dim * 4)
+	s_xb2 = alloc(dim * 4)
+	s_hb = alloc(hidden_dim * 4)
+	s_hb2 = alloc(hidden_dim * 4)
+	s_q = alloc(dim * 4)
+	s_att = alloc(n_heads * seq_len * 4)
+	s_logits = alloc(vocab_size * 4)
+	s_key_cache = alloc(n_layers * seq_len * kv_dim * 4)
+	s_val_cache = alloc(n_layers * seq_len * kv_dim * 4)
+}
+
+func load_tokenizer(path) {
+	b := read_file_bytes(path)
+	if len(b) == 0 { println("cannot read tokenizer: " + path)  exit(1) }
+	off := 4 // skip max_token_length
+	i := 0
+	while i < vocab_size {
+		off = off + 4 // skip fp32 score
+		n := read_i32(b, off)
+		off = off + 4
+		vocab = append(vocab, bytes_str(bytes_sub(b, off, off+n)))
+		off = off + n
+		i = i + 1
+	}
+}
+
+// ---- math kernels ----
+
+func rmsnorm(dst, x, w, size) {
+	ss := 0.0
+	j := 0
+	while j < size {
+		v := peek_f32(x, j*4)
+		ss = ss + v * v
+		j = j + 1
+	}
+	ss = ss / float(size)
+	ss = 1.0 / sqrt(ss + 0.00001)
+	j = 0
+	while j < size {
+		poke_f32(dst, j*4, peek_f32(w, j*4) * ss * peek_f32(x, j*4))
+		j = j + 1
+	}
+}
+
+func softmax(x, size) {
+	mx := peek_f32(x, 0)
+	i := 1
+	while i < size {
+		v := peek_f32(x, i*4)
+		if v > mx { mx = v }
+		i = i + 1
+	}
+	sum := 0.0
+	i = 0
+	while i < size {
+		e := exp(peek_f32(x, i*4) - mx)
+		poke_f32(x, i*4, e)
+		sum = sum + e
+		i = i + 1
+	}
+	i = 0
+	while i < size {
+		poke_f32(x, i*4, peek_f32(x, i*4) / sum)
+		i = i + 1
+	}
+}
+
+// xout[d] = W[d,n] @ x[n]
+func matmul(xout, x, w, n, d) {
+	i := 0
+	while i < d {
+		val := 0.0
+		row := w + i * n * 4
+		j := 0
+		while j < n {
+			val = val + peek_f32(row, j*4) * peek_f32(x, j*4)
+			j = j + 1
+		}
+		poke_f32(xout, i*4, val)
+		i = i + 1
+	}
+}
+
+func forward(token, pos) {
+	// copy token embedding into x
+	emb := wbuf + w_tok_emb + token * dim * 4
+	i := 0
+	while i < dim {
+		poke_f32(s_x, i*4, peek_f32(emb, i*4))
+		i = i + 1
+	}
+	l := 0
+	while l < n_layers {
+		rmsnorm(s_xb, s_x, wbuf + w_rms_att + l * dim * 4, dim)
+		// qkv; k and v write straight into the kv cache at this position
+		loff := l * seq_len * kv_dim
+		kptr := s_key_cache + (loff + pos * kv_dim) * 4
+		vptr := s_val_cache + (loff + pos * kv_dim) * 4
+		matmul(s_q, s_xb, wbuf + w_q + l * dim * dim * 4, dim, dim)
+		matmul(kptr, s_xb, wbuf + w_k + l * dim * kv_dim * 4, dim, kv_dim)
+		matmul(vptr, s_xb, wbuf + w_v + l * dim * kv_dim * 4, dim, kv_dim)
+		// RoPE: rotate adjacent pairs of q (all dims) and k (kv dims)
+		i = 0
+		while i < dim {
+			hd := i % head_size
+			freq := 1.0 / pow(10000.0, float(hd) / float(head_size))
+			val := float(pos) * freq
+			fcr := cos(val)
+			fci := sin(val)
+			q0 := peek_f32(s_q, i*4)
+			q1 := peek_f32(s_q, i*4+4)
+			poke_f32(s_q, i*4, q0 * fcr - q1 * fci)
+			poke_f32(s_q, i*4+4, q0 * fci + q1 * fcr)
+			if i < kv_dim {
+				k0 := peek_f32(kptr, i*4)
+				k1 := peek_f32(kptr, i*4+4)
+				poke_f32(kptr, i*4, k0 * fcr - k1 * fci)
+				poke_f32(kptr, i*4+4, k0 * fci + k1 * fcr)
+			}
+			i = i + 2
+		}
+		// multihead attention
+		kv_mul := n_heads / n_kv_heads
+		h := 0
+		while h < n_heads {
+			qh := s_q + h * head_size * 4
+			atth := s_att + h * seq_len * 4
+			t := 0
+			while t <= pos {
+				kt := s_key_cache + (loff + t * kv_dim + (h / kv_mul) * head_size) * 4
+				score := 0.0
+				j := 0
+				while j < head_size {
+					score = score + peek_f32(qh, j*4) * peek_f32(kt, j*4)
+					j = j + 1
+				}
+				poke_f32(atth, t*4, score / sqrt(float(head_size)))
+				t = t + 1
+			}
+			softmax(atth, pos + 1)
+			// weighted sum of values -> xb
+			xbh := s_xb + h * head_size * 4
+			j := 0
+			while j < head_size {
+				poke_f32(xbh, j*4, 0.0)
+				j = j + 1
+			}
+			t = 0
+			while t <= pos {
+				vt := s_val_cache + (loff + t * kv_dim + (h / kv_mul) * head_size) * 4
+				a := peek_f32(atth, t*4)
+				j = 0
+				while j < head_size {
+					poke_f32(xbh, j*4, peek_f32(xbh, j*4) + a * peek_f32(vt, j*4))
+					j = j + 1
+				}
+				t = t + 1
+			}
+			h = h + 1
+		}
+		// attention output projection + residual
+		matmul(s_xb2, s_xb, wbuf + w_o + l * dim * dim * 4, dim, dim)
+		i = 0
+		while i < dim {
+			poke_f32(s_x, i*4, peek_f32(s_x, i*4) + peek_f32(s_xb2, i*4))
+			i = i + 1
+		}
+		// ffn: w2( silu(w1 x) * w3 x ) + residual
+		rmsnorm(s_xb, s_x, wbuf + w_rms_ffn + l * dim * 4, dim)
+		matmul(s_hb, s_xb, wbuf + w_1 + l * dim * hidden_dim * 4, dim, hidden_dim)
+		matmul(s_hb2, s_xb, wbuf + w_3 + l * dim * hidden_dim * 4, dim, hidden_dim)
+		i = 0
+		while i < hidden_dim {
+			v := peek_f32(s_hb, i*4)
+			v = v * (1.0 / (1.0 + exp(0.0 - v)))
+			poke_f32(s_hb, i*4, v * peek_f32(s_hb2, i*4))
+			i = i + 1
+		}
+		matmul(s_xb, s_hb, wbuf + w_2 + l * hidden_dim * dim * 4, hidden_dim, dim)
+		i = 0
+		while i < dim {
+			poke_f32(s_x, i*4, peek_f32(s_x, i*4) + peek_f32(s_xb, i*4))
+			i = i + 1
+		}
+		l = l + 1
+	}
+	rmsnorm(s_x, s_x, wbuf + w_rms_final, dim)
+	matmul(s_logits, s_x, wbuf + w_cls, dim, vocab_size)
+}
+
+func argmax_logits() (best) {
+	best = 0
+	bv := peek_f32(s_logits, 0)
+	i := 1
+	while i < vocab_size {
+		v := peek_f32(s_logits, i*4)
+		if v > bv { bv = v  best = i }
+		i = i + 1
+	}
+	return
+}
+
+// llama2.c decode: strip leading space after BOS, expand <0xXX> byte tokens
+func decode_piece(prev, token) (piece) {
+	piece = vocab[token]
+	if prev == 1 && has_prefix(piece, " ") { piece = substr(piece, 1, len(piece)) }
+	if has_prefix(piece, "<0x") && has_suffix(piece, ">") {
+		piece = bytes_str(from_hex(substr(piece, 3, 5)))
+	}
+	return
+}
+
+func main() {
+	a := args()
+	model := "models/stories15M.bin"
+	steps := 64
+	if len(a) > 1 { model = a[1] }
+	if len(a) > 2 { steps = parse_int(a[2]) }
+	t0 := now_ms()
+	load_model(model)
+	alloc_state()
+	load_tokenizer("models/tokenizer.bin")
+	t1 := now_ms()
+	println("loaded: dim=" + str(dim) + " hidden=" + str(hidden_dim) + " layers=" + str(n_layers) + " heads=" + str(n_heads) + " vocab=" + str(vocab_size) + " seq=" + str(seq_len) + " (" + str(t1 - t0) + " ms)")
+	if steps > seq_len { steps = seq_len }
+	token := 1 // BOS
+	pos := 0
+	t2 := now_ms()
+	while pos < steps {
+		forward(token, pos)
+		next := argmax_logits()
+		if next == 1 { break }
+		print(decode_piece(token, next))
+		flush()
+		token = next
+		pos = pos + 1
+	}
+	t3 := now_ms()
+	println("")
+	gen := pos
+	if t3 > t2 && gen > 0 {
+		tps := float(gen) * 1000.0 / float(t3 - t2)
+		println("tokens: " + str(gen) + "  time: " + str(t3 - t2) + " ms  tok/s: " + str(tps))
+	}
+}
