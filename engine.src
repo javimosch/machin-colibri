@@ -149,6 +149,7 @@ func alloc_state() {
 	s_xq_s = alloc((dim / gs) * 4)
 	s_hq = alloc(hidden_dim)
 	s_hq_s = alloc((hidden_dim / gs) * 4)
+	cache_buf = alloc(seq_len * 4) // persistent prefix-cache token bookkeeping
 }
 
 func load_tokenizer(path) {
@@ -688,15 +689,21 @@ func sample_next(temp, topp) (tok) {
 
 // ---- generation with single-slot KV prefix cache ----
 
-var cache_toks = []int{} // tokens forwarded at positions 0..len-1 (KV valid)
+// Prefix-cache bookkeeping lives in a RAW buffer, not an MFL slice: the server
+// runs each request in its own goroutine whose arena is reclaimed on return, so
+// a slice global written by request N is dangling for request N+1 (the KV cache
+// itself is in persistent alloc'd buffers, so only this bookkeeping needed
+// moving). cache_buf holds the token ids at positions 0..cache_len-1.
+var cache_buf = 0
+var cache_len = 0
 
 // common prefix length of cached tokens vs the new prompt
 func cache_common(toks) (l) {
 	l = 0
 	n := len(toks)
-	if len(cache_toks) < n { n = len(cache_toks) }
+	if cache_len < n { n = cache_len }
 	while l < n {
-		if cache_toks[l] != toks[l] { return }
+		if peek_i32(cache_buf, l*4) != toks[l] { return }
 		l = l + 1
 	}
 	return
@@ -717,24 +724,26 @@ func generate_cb(toks, max_new, temp, topp, emit) (gen) {
 		forward(toks[i], i)
 		i = i + 1
 	}
-	nc := []int{}
+	// record the prompt tokens into the persistent cache buffer
 	i = 0
-	while i < np { nc = append(nc, toks[i])  i = i + 1 }
+	while i < np { poke_i32(cache_buf, i*4, toks[i])  i = i + 1 }
+	cache_len = np
 	pos := np
 	token := 0
+	prev := 1
+	if np > 0 { prev = toks[np-1] }
 	gen = 0
 	while gen < max_new && pos < seq_len {
 		token = sample_next(temp, topp)
 		if is_stop_token(token) { break }
-		prev := 1
-		if gen > 0 || np > 0 { prev = nc[len(nc)-1] }
 		emit(piece_text(prev, token))
-		nc = append(nc, token)
 		forward(token, pos)
+		poke_i32(cache_buf, pos*4, token) // extend the cache with the accepted token
+		cache_len = pos + 1
+		prev = token
 		pos = pos + 1
 		gen = gen + 1
 	}
-	cache_toks = nc
 	return
 }
 
