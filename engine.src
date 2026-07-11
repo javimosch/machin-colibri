@@ -87,35 +87,38 @@ func f32_at(b, off) (v) {
 func qblock(size) (n) { n = wsz(size) + 4 * (size / gs)  return }
 
 func load_model(path) {
-	b := read_file_bytes(path)
-	if len(b) == 0 { println("cannot read model: " + path)  exit(1) }
-	m := read_i32(b, 0)
+	// zero-copy: mmap the checkpoint; the on-disk bytes ARE the C-struct layout,
+	// so peek_* reads header + weights directly (pages fault in lazily). This is
+	// what makes load near-instant instead of a multi-GB read+copy.
+	mb, _ := mmap_file(path)
+	wbuf = mb
+	if wbuf == 0 { println("cannot mmap model: " + path)  exit(1) }
+	m := peek_i32(wbuf, 0)
 	v4 := 0
 	if m == 1634415666 { quant4 = 0 } else { // 0x616b3432 "ak42" (int8 v2)
 		if m == 1634415667 { quant4 = 1 } else { // 0x616b3433 "ak43" (int4 v3)
 			if m == 1634415668 { quant4 = 0  v4 = 1 } else { println("bad magic (want ak42/ak43/ak44)")  exit(1) } // 0x616b3434 "ak44" (int8 + rope header)
 		}
 	}
-	dim = read_i32(b, 8)
-	hidden_dim = read_i32(b, 12)
-	n_layers = read_i32(b, 16)
-	n_heads = read_i32(b, 20)
-	n_kv_heads = read_i32(b, 24)
-	vocab_size = read_i32(b, 28)
-	seq_len = read_i32(b, 32)
-	shared_cls = byte_at(b, 36)
-	gs = read_i32(b, 37)
+	dim = peek_i32(wbuf, 8)
+	hidden_dim = peek_i32(wbuf, 12)
+	n_layers = peek_i32(wbuf, 16)
+	n_heads = peek_i32(wbuf, 20)
+	n_kv_heads = peek_i32(wbuf, 24)
+	vocab_size = peek_i32(wbuf, 28)
+	seq_len = peek_i32(wbuf, 32)
+	shared_cls = peek_u8(wbuf, 36)
+	gs = peek_i32(wbuf, 37)
 	if v4 == 1 {
-		rope_theta = f32_at(b, 41)
-		l3_scaling = byte_at(b, 45)
-		l3_factor = f32_at(b, 46)
-		l3_low = f32_at(b, 50)
-		l3_high = f32_at(b, 54)
-		l3_orig = read_i32(b, 58)
+		rope_theta = peek_f32(wbuf, 41)
+		l3_scaling = peek_u8(wbuf, 45)
+		l3_factor = peek_f32(wbuf, 46)
+		l3_low = peek_f32(wbuf, 50)
+		l3_high = peek_f32(wbuf, 54)
+		l3_orig = peek_i32(wbuf, 58)
 	}
 	head_size = dim / n_heads
 	kv_dim = (dim * n_kv_heads) / n_heads
-	wbuf = bytes_to_buf(b)
 	o := 256
 	w_rms_att = o    o = o + n_layers * dim * 4
 	w_rms_ffn = o    o = o + n_layers * dim * 4
@@ -781,15 +784,20 @@ func load_tokenizer_l3(path) {
 	n := read_i32(b, 0)
 	off := 4
 	i := 0
+	// build into a LOCAL slice then assign the global once: appending directly
+	// to a global slice reallocates its backing array every call (O(n^2); ~31s
+	// for the 128k-entry llama3 vocab). One assignment at the end is O(n).
+	v := []string{}
 	while i < n {
 		l := read_i32(b, off)
 		off = off + 4
 		tb := bytes_sub(b, off, off+l)
-		vocab_l3 = append(vocab_l3, bytes_str(tb))
+		v = append(v, bytes_str(tb))
 		if i < 128000 { l3_idx[to_hex(tb)] = i }
 		off = off + l
 		i = i + 1
 	}
+	vocab_l3 = v
 }
 
 // ---- pretokenizer: hand-rolled state machine for the llama3 regex ----
