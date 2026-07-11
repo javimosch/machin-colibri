@@ -33,9 +33,43 @@ func mutex_srv(acq, rel) {
 	}
 }
 
+// llama3 chat template at the TOKEN level:
+// <|begin_of_text|>(<|start_header_id|>{role}<|end_header_id|>\n\n{content}<|eot_id|>)*<|start_header_id|>assistant<|end_header_id|>\n\n
+func l3_chat_tokens(msgs) (toks) {
+	toks = []int{}
+	toks = append(toks, 128000)
+	i := 0
+	while i < len(msgs) {
+		m := msgs[i]
+		toks = append(toks, 128006)
+		seg := l3_encode(m.role)
+		j := 0
+		while j < len(seg) { toks = append(toks, seg[j])  j = j + 1 }
+		toks = append(toks, 128007)
+		seg = l3_encode("\n\n" + m.content)
+		j = 0
+		while j < len(seg) { toks = append(toks, seg[j])  j = j + 1 }
+		toks = append(toks, 128009)
+		i = i + 1
+	}
+	toks = append(toks, 128006)
+	seg := l3_encode("assistant")
+	i = 0
+	while i < len(seg) { toks = append(toks, seg[i])  i = i + 1 }
+	toks = append(toks, 128007)
+	seg = l3_encode("\n\n")
+	i = 0
+	while i < len(seg) { toks = append(toks, seg[i])  i = i + 1 }
+	return
+}
+
 // Zephyr chat template at the TOKEN level: "</s>" must be the real EOS id (2),
 // not the text "</s>" run through BPE (they tokenize differently).
 func chat_tokens(msgs) (toks) {
+	if tok_l3 == 1 {
+		toks = l3_chat_tokens(msgs)
+		return
+	}
 	toks = []int{}
 	toks = append(toks, 1) // BOS
 	i := 0
@@ -149,7 +183,8 @@ func main() {
 	t0 := now_ms()
 	load_model(model)
 	alloc_state()
-	load_tokenizer("models/tokenizer.bin")
+	load_tokenizer_auto()
+	if tok_l3 == 1 { model_id = "llama-3.2-1b-instruct-q80" }
 	w := 0
 	while w < n_workers { go worker(jobs, done)  w = w + 1 }
 	go mutex_srv(mu_acq, mu_rel)

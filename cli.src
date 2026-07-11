@@ -12,13 +12,13 @@ func main() {
 	t0 := now_ms()
 	load_model(model)
 	alloc_state()
-	load_tokenizer("models/tokenizer.bin")
+	load_tokenizer_auto()
 	w := 0
 	while w < n_workers { go worker(jobs, done)  w = w + 1 }
 	t1 := now_ms()
 	println("loaded: dim=" + str(dim) + " hidden=" + str(hidden_dim) + " layers=" + str(n_layers) + " heads=" + str(n_heads) + " kv_heads=" + str(n_kv_heads) + " vocab=" + str(vocab_size) + " seq=" + str(seq_len) + " gs=" + str(gs) + " shared_cls=" + str(shared_cls) + " (" + str(t1 - t0) + " ms)")
 	if steps > seq_len { steps = seq_len }
-	ptoks := bpe_encode(prompt)
+	ptoks := encode_text(prompt)
 	token := ptoks[0]
 	pos := 0
 	t2 := now_ms()
@@ -32,8 +32,8 @@ func main() {
 		next := 0
 		if pos < len(ptoks) - 1 { next = ptoks[pos+1] } else { next = argmax_logits() }
 		pos = pos + 1
-		if next == 1 || next == 2 { break } // BOS/EOS
-		print(decode_piece(token, next))
+		if is_stop_token(next) { break }
+		print(piece_text(token, next))
 		flush()
 		token = next
 	}

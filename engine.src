@@ -74,6 +74,15 @@ func bytes_to_buf(b) (p) {
 
 // packed quant bytes for a tensor: int8 = size, int4 = size/2 (split-nibble)
 func wsz(size) (n) { n = size  if quant4 == 1 { n = size / 2 }  return }
+// read an f32 from a bytes value at any offset (header fields)
+func f32_at(b, off) (v) {
+	p := alloc(4)
+	poke_i32(p, 0, byte_at(b, off) | byte_at(b, off+1) << 8 | byte_at(b, off+2) << 16 | byte_at(b, off+3) << 24)
+	v = peek_f32(p, 0)
+	free(p)
+	return
+}
+
 // quantized tensor block size in bytes: packed q values + size/gs fp32 scales
 func qblock(size) (n) { n = wsz(size) + 4 * (size / gs)  return }
 
@@ -81,8 +90,11 @@ func load_model(path) {
 	b := read_file_bytes(path)
 	if len(b) == 0 { println("cannot read model: " + path)  exit(1) }
 	m := read_i32(b, 0)
+	v4 := 0
 	if m == 1634415666 { quant4 = 0 } else { // 0x616b3432 "ak42" (int8 v2)
-		if m == 1634415667 { quant4 = 1 } else { println("bad magic (want ak42 v2 int8 or ak43 v3 int4)")  exit(1) } // 0x616b3433
+		if m == 1634415667 { quant4 = 1 } else { // 0x616b3433 "ak43" (int4 v3)
+			if m == 1634415668 { quant4 = 0  v4 = 1 } else { println("bad magic (want ak42/ak43/ak44)")  exit(1) } // 0x616b3434 "ak44" (int8 + rope header)
+		}
 	}
 	dim = read_i32(b, 8)
 	hidden_dim = read_i32(b, 12)
@@ -93,6 +105,14 @@ func load_model(path) {
 	seq_len = read_i32(b, 32)
 	shared_cls = byte_at(b, 36)
 	gs = read_i32(b, 37)
+	if v4 == 1 {
+		rope_theta = f32_at(b, 41)
+		l3_scaling = byte_at(b, 45)
+		l3_factor = f32_at(b, 46)
+		l3_low = f32_at(b, 50)
+		l3_high = f32_at(b, 54)
+		l3_orig = read_i32(b, 58)
+	}
 	head_size = dim / n_heads
 	kv_dim = (dim * n_kv_heads) / n_heads
 	wbuf = bytes_to_buf(b)
@@ -311,7 +331,7 @@ func rope(l, pos) {
 	i := 0
 	while i < dim {
 		hd := i % head_size
-		freq := 1.0 / pow(10000.0, float(hd) / float(head_size))
+		freq := rope_freq(hd)
 		val := float(pos) * freq
 		fcr := cos(val)
 		fci := sin(val)
@@ -702,10 +722,10 @@ func generate_cb(toks, max_new, temp, topp, emit) (gen) {
 	gen = 0
 	while gen < max_new && pos < seq_len {
 		token = sample_next(temp, topp)
-		if token == 1 || token == 2 { break } // BOS/EOS
+		if is_stop_token(token) { break }
 		prev := 1
 		if gen > 0 || np > 0 { prev = nc[len(nc)-1] }
-		emit(decode_piece(prev, token))
+		emit(piece_text(prev, token))
 		nc = append(nc, token)
 		forward(token, pos)
 		pos = pos + 1
@@ -718,5 +738,318 @@ func generate_cb(toks, max_new, temp, topp, emit) (gen) {
 // raw BPE encode without BOS/dummy-prefix (for mid-template segments)
 func bpe_encode_raw(text) (toks) {
 	toks = bpe_encode_opts(text, 0, 0)
+	return
+}
+
+// ---- Llama-3 support: v4 header, RoPE scaling, tiktoken BPE ----
+
+var rope_theta = 10000.0
+var l3_scaling = 0
+var l3_factor = 1.0
+var l3_low = 1.0
+var l3_high = 1.0
+var l3_orig = 8192
+var tok_l3 = 0 // 1 = tiktoken (llama3), 0 = sentencepiece (llama2)
+
+// llama3 rope frequency scaling (HF/llama.cpp formula)
+func rope_freq(hd) (freq) {
+	freq = 1.0 / pow(rope_theta, float(hd) / float(head_size))
+	if l3_scaling == 1 {
+		wavelen := 2.0 * pi() / freq
+		lowwl := float(l3_orig) / l3_low
+		highwl := float(l3_orig) / l3_high
+		if wavelen > lowwl {
+			freq = freq / l3_factor
+		} else {
+			if wavelen > highwl {
+				smooth := (float(l3_orig) / wavelen - l3_low) / (l3_high - l3_low)
+				freq = (1.0 - smooth) * (freq / l3_factor) + smooth * freq
+			}
+		}
+	}
+	return
+}
+
+// ---- tiktoken tokenizer (llama3): id -> raw bytes; encode via lowest-rank merges ----
+
+var vocab_l3 = []string{}       // decode text (NUL-containing byte tokens degrade harmlessly)
+var l3_idx = make(map[string]int) // hex(token bytes) -> id
+
+func load_tokenizer_l3(path) {
+	b := read_file_bytes(path)
+	if len(b) == 0 { println("cannot read tokenizer: " + path)  exit(1) }
+	n := read_i32(b, 0)
+	off := 4
+	i := 0
+	while i < n {
+		l := read_i32(b, off)
+		off = off + 4
+		tb := bytes_sub(b, off, off+l)
+		vocab_l3 = append(vocab_l3, bytes_str(tb))
+		if i < 128000 { l3_idx[to_hex(tb)] = i }
+		off = off + l
+		i = i + 1
+	}
+}
+
+// ---- pretokenizer: hand-rolled state machine for the llama3 regex ----
+// (?i:'s|'t|'re|'ve|'m|'ll|'d) | [^\r\n\p{L}\p{N}]?\p{L}+ | \p{N}{1,3}
+// | ?[^\s\p{L}\p{N}]+[\r\n]* | \s*[\r\n]+ | \s+(?!\S) | \s+
+// \p{L}/\p{N} approximated: exact for ASCII/Latin/Greek/Cyrillic/CJK/kana/
+// Hangul/Hebrew/Arabic; rare scripts may split differently (disclosed).
+
+func cp_at(b, i) (cp, n) {
+	c := byte_at(b, i)
+	cp = c
+	n = 1
+	if c < 128 { return }
+	if (c & 224) == 192 { cp = (c & 31) << 6 | (byte_at(b, i+1) & 63)  n = 2  return }
+	if (c & 240) == 224 { cp = (c & 15) << 12 | (byte_at(b, i+1) & 63) << 6 | (byte_at(b, i+2) & 63)  n = 3  return }
+	cp = (c & 7) << 18 | (byte_at(b, i+1) & 63) << 12 | (byte_at(b, i+2) & 63) << 6 | (byte_at(b, i+3) & 63)
+	n = 4
+	return
+}
+
+func is_letter(cp) (r) {
+	r = false
+	if cp >= 65 && cp <= 90 { r = true  return }
+	if cp >= 97 && cp <= 122 { r = true  return }
+	if cp >= 192 && cp <= 591 && cp != 215 && cp != 247 { r = true  return } // Latin-1..Ext-B
+	if cp >= 880 && cp <= 1023 { r = true  return }   // Greek
+	if cp >= 1024 && cp <= 1279 { r = true  return }  // Cyrillic
+	if cp >= 1425 && cp <= 1524 { r = true  return }  // Hebrew
+	if cp >= 1536 && cp <= 1791 { r = true  return }  // Arabic
+	if cp >= 12352 && cp <= 12543 { r = true  return } // kana
+	if cp >= 19968 && cp <= 40959 { r = true  return } // CJK
+	if cp >= 44032 && cp <= 55215 { r = true  return } // Hangul
+	return
+}
+
+func is_digit_cp(cp) (r) {
+	r = false
+	if cp >= 48 && cp <= 57 { r = true }
+	return
+}
+
+func is_space_cp(cp) (r) {
+	r = false
+	if cp == 32 || cp == 9 || cp == 10 || cp == 13 || cp == 12 || cp == 11 || cp == 160 { r = true }
+	return
+}
+
+// contraction suffix at byte offset i (after an apostrophe was seen AT i): 's 't 're 've 'm 'll 'd
+func l3_contraction_len(b, i, n) (l) {
+	l = 0
+	if byte_at(b, i) != 39 { return } // '
+	if i + 1 >= n { return }
+	c1 := byte_at(b, i+1) | 32
+	if c1 == 115 || c1 == 116 || c1 == 109 || c1 == 100 { l = 2  return } // 's 't 'm 'd
+	if i + 2 < n {
+		c2 := byte_at(b, i+2) | 32
+		if (c1 == 114 && c2 == 101) || (c1 == 118 && c2 == 101) || (c1 == 108 && c2 == 108) { l = 3  return } // 're 've 'll
+	}
+	return
+}
+
+func l3_pretok(text) (parts) {
+	parts = []string{}
+	b := bytes(text)
+	n := len(b)
+	i := 0
+	while i < n {
+		// 1. contraction
+		cl := l3_contraction_len(b, i, n)
+		if cl > 0 { parts = append(parts, bytes_str(bytes_sub(b, i, i+cl)))  i = i + cl  continue }
+		cp, w := cp_at(b, i)
+		// 2. optional non-letter/digit/newline char + letter run
+		j := i
+		pfx := 0
+		if is_letter(cp) == false && is_digit_cp(cp) == false && cp != 10 && cp != 13 {
+			j = i + w
+			pfx = 1
+		}
+		if j < n {
+			c2, w2 := cp_at(b, j)
+			if is_letter(c2) {
+				k := j
+				while k < n {
+					c3, w3 := cp_at(b, k)
+					if is_letter(c3) == false { break }
+					k = k + w3
+					w2 = w2
+				}
+				// don't let a letter run absorb an apostrophe-contraction boundary; regex doesn't either
+				parts = append(parts, bytes_str(bytes_sub(b, i, k)))
+				i = k
+				continue
+			}
+		}
+		if pfx == 1 { j = i } // reset if prefix path failed
+		// 3. 1-3 digits
+		if is_digit_cp(cp) {
+			k := i
+			cnt := 0
+			while k < n && cnt < 3 {
+				c3, w3 := cp_at(b, k)
+				if is_digit_cp(c3) == false { break }
+				k = k + w3
+				cnt = cnt + 1
+			}
+			parts = append(parts, bytes_str(bytes_sub(b, i, k)))
+			i = k
+			continue
+		}
+		// 4. optional space + punct run + trailing newlines
+		j = i
+		if cp == 32 { j = i + 1 }
+		if j < n {
+			c2, w2 := cp_at(b, j)
+			if is_space_cp(c2) == false && is_letter(c2) == false && is_digit_cp(c2) == false {
+				k := j
+				while k < n {
+					c3, w3 := cp_at(b, k)
+					if is_space_cp(c3) || is_letter(c3) || is_digit_cp(c3) { break }
+					k = k + w3
+				}
+				while k < n && (byte_at(b, k) == 10 || byte_at(b, k) == 13) { k = k + 1 }
+				parts = append(parts, bytes_str(bytes_sub(b, i, k)))
+				i = k
+				continue
+			}
+		}
+		// 5/6/7. whitespace forms
+		if is_space_cp(cp) {
+			k := i
+			has_nl := 0
+			last_nl_end := i
+			while k < n {
+				c3, w3 := cp_at(b, k)
+				if is_space_cp(c3) == false { break }
+				k = k + w3
+				if c3 == 10 || c3 == 13 { has_nl = 1  last_nl_end = k }
+			}
+			// \s*[\r\n]+ : whitespace ending in newline(s) — match up to last newline
+			if has_nl == 1 && last_nl_end > i {
+				trail := 1
+				m := last_nl_end
+				while m < k { // only spaces after last newline remain
+					m = m + 1
+				}
+				parts = append(parts, bytes_str(bytes_sub(b, i, last_nl_end)))
+				i = last_nl_end
+				trail = trail
+				continue
+			}
+			// \s+(?!\S): all but the last space if a word follows
+			if k < n && k - i > 1 {
+				parts = append(parts, bytes_str(bytes_sub(b, i, k-1)))
+				i = k - 1
+				continue
+			}
+			if k == n {
+				parts = append(parts, bytes_str(bytes_sub(b, i, k)))
+				i = k
+				continue
+			}
+			// single space before non-space: shouldn't reach (case 2/4 handle), but be safe
+			parts = append(parts, bytes_str(bytes_sub(b, i, k)))
+			i = k
+			continue
+		}
+		// fallback: single codepoint
+		parts = append(parts, bytes_str(bytes_sub(b, i, i+w)))
+		i = i + w
+	}
+	return
+}
+
+// tiktoken BPE over one pretoken: greedy lowest-id adjacent merge, hex-string symbols
+func l3_bpe_piece(piece) (ids) {
+	ids = []int{}
+	pb := bytes(piece)
+	syms := []string{}
+	i := 0
+	while i < len(pb) {
+		syms = append(syms, to_hex(bytes_sub(pb, i, i+1)))
+		i = i + 1
+	}
+	while len(syms) > 1 {
+		best := -1
+		best_id := 999999999
+		i = 0
+		while i < len(syms) - 1 {
+			m := syms[i] + syms[i+1]
+			if has(l3_idx, m) {
+				id := l3_idx[m]
+				if id < best_id { best_id = id  best = i }
+			}
+			i = i + 1
+		}
+		if best < 0 { break }
+		ns := []string{}
+		i = 0
+		while i < len(syms) {
+			if i == best { ns = append(ns, syms[i] + syms[i+1])  i = i + 2 } else { ns = append(ns, syms[i])  i = i + 1 }
+		}
+		syms = ns
+	}
+	i = 0
+	while i < len(syms) {
+		if has(l3_idx, syms[i]) { ids = append(ids, l3_idx[syms[i]]) }
+		i = i + 1
+	}
+	return
+}
+
+// encode text with the llama3 tokenizer (no specials)
+func l3_encode(text) (ids) {
+	ids = []int{}
+	parts := l3_pretok(text)
+	i := 0
+	while i < len(parts) {
+		sub := l3_bpe_piece(parts[i])
+		j := 0
+		while j < len(sub) { ids = append(ids, sub[j])  j = j + 1 }
+		i = i + 1
+	}
+	return
+}
+
+// unified helpers used by cli/serve
+func load_tokenizer_auto() {
+	if vocab_size > 100000 { tok_l3 = 1  load_tokenizer_l3("models/tokenizer-l3.bin")  return }
+	load_tokenizer("models/tokenizer.bin")
+}
+
+func encode_text(text) (ids) {
+	if tok_l3 == 1 {
+		ids = []int{}
+		ids = append(ids, 128000) // <|begin_of_text|>
+		sub := l3_encode(text)
+		i := 0
+		while i < len(sub) { ids = append(ids, sub[i])  i = i + 1 }
+		return
+	}
+	ids = bpe_encode(text)
+	return
+}
+
+func piece_text(prev, token) (s) {
+	if tok_l3 == 1 {
+		s = ""
+		if token < 128000 { s = vocab_l3[token] }
+		return
+	}
+	s = decode_piece(prev, token)
+	return
+}
+
+func is_stop_token(t) (r) {
+	r = false
+	if tok_l3 == 1 {
+		if t == 128009 || t == 128001 || t == 128008 { r = true }
+		return
+	}
+	if t == 1 || t == 2 { r = true }
 	return
 }
