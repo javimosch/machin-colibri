@@ -6,9 +6,9 @@ A clean-room LLM inference engine in **pure MFL** ([machin](https://github.com/j
 
 ## Status
 
-- **M0 — correctness: DONE.** fp32 forward pass of llama2.c-format checkpoints. Greedy decode of `stories15M` matches karpathy's `run.c` **token-for-token over 200 tokens**. ~66 tok/s single-thread naive (15M model).
-- **M1 — real 1B model, int8, honest single-thread tok/s:** next.
-- **M2 — the 20 tok/s challenge:** parallel matmul (machin goroutines, inferred race-freedom) + quantization on defined hardware.
+- **M0 — correctness: DONE.** fp32 forward pass of llama2.c-format checkpoints (`colibri.src`). Greedy decode of `stories15M` matches karpathy's `run.c` **token-for-token over 200 tokens**. ~66 tok/s single-thread naive (15M model).
+- **M1 — real 1B model, int8: DONE.** `colibri_q.src` runs llama2.c *version-2* (Q8_0 group-quantized) checkpoints — GQA, BPE prompt encoding included. On **TinyLlama-1.1B-Chat**: greedy argmax **identical to `runq.c` at all 48 compared positions**, and **2.0–2.1 tok/s single-thread** — faster than the reference scalar C (`runq.c -O2`: 1.67 tok/s) on the same box (i7-class 8-core, DDR4).
+- **M2 — the 20 tok/s challenge:** parallel matmul (machin goroutines, inferred race-freedom) + lower-bit quantization. 20 tok/s × 1.17 GB ≈ 23 GB/s memory traffic — right at commodity-DDR4 bandwidth, so int8 threads alone won't be enough; int4 is on the table.
 
 ## Run
 
@@ -20,6 +20,18 @@ machin encode colibri.src > colibri.mfl
 machin build colibri.mfl -o colibri
 ./colibri models/stories15M.bin 200
 ```
+
+### 1B int8
+
+Convert once with llama2.c's `export.py` (needs a GQA patch for `--hf`: set `n_kv_heads` from `num_key_value_heads` and permute k_proj with kv dims), then:
+
+```sh
+machin encode colibri_q.src > colibri_q.mfl
+machin build colibri_q.mfl -o colibri_q
+./colibri_q models/tinyllama-1.1b-q80.bin 64 "The capital of France is"
+```
+
+`DL=1` dumps per-position argmax+logits for diffing against a similarly-patched `runq.c`.
 
 ## Design notes
 
