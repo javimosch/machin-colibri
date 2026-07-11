@@ -1,0 +1,2 @@
+#!/bin/sh
+exec gcc -O3 -march=native -mprefer-vector-width=512 -funroll-loops "$@" -O3

@@ -1,0 +1,2 @@
+#!/bin/sh
+exec gcc -O3 -march=native -funroll-loops "$@" -O3

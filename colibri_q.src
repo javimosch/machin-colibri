@@ -14,6 +14,7 @@ var head_size = 0
 var kv_dim = 0
 var gs = 0
 var shared_cls = 0
+var quant4 = 0
 
 // ---- weight offsets into the checkpoint buffer (bytes) ----
 var wbuf = 0
@@ -42,7 +43,7 @@ var s_att = 0
 var s_logits = 0
 var s_key_cache = 0
 var s_val_cache = 0
-var s_xq = 0    // quantized activation values (int32 slots for speed)
+var s_xq = 0    // quantized activation values (int8 bytes)
 var s_xq_s = 0  // fp32 group scales
 var s_hq = 0
 var s_hq_s = 0
@@ -71,14 +72,18 @@ func bytes_to_buf(b) (p) {
 	return
 }
 
-// quantized tensor block size in bytes: size int8 values + size/gs fp32 scales
-func qblock(size) (n) { n = size + 4 * (size / gs)  return }
+// packed quant bytes for a tensor: int8 = size, int4 = size/2 (split-nibble)
+func wsz(size) (n) { n = size  if quant4 == 1 { n = size / 2 }  return }
+// quantized tensor block size in bytes: packed q values + size/gs fp32 scales
+func qblock(size) (n) { n = wsz(size) + 4 * (size / gs)  return }
 
 func load_model(path) {
 	b := read_file_bytes(path)
 	if len(b) == 0 { println("cannot read model: " + path)  exit(1) }
-	if read_i32(b, 0) != 1634415666 { println("bad magic (want ak42/version2 checkpoint)")  exit(1) } // 0x616b3432
-	if read_i32(b, 4) != 2 { println("bad version: " + str(read_i32(b, 4)))  exit(1) }
+	m := read_i32(b, 0)
+	if m == 1634415666 { quant4 = 0 } else { // 0x616b3432 "ak42" (int8 v2)
+		if m == 1634415667 { quant4 = 1 } else { println("bad magic (want ak42 v2 int8 or ak43 v3 int4)")  exit(1) } // 0x616b3433
+	}
 	dim = read_i32(b, 8)
 	hidden_dim = read_i32(b, 12)
 	n_layers = read_i32(b, 16)
@@ -117,9 +122,9 @@ func alloc_state() {
 	s_logits = alloc(vocab_size * 4)
 	s_key_cache = alloc(n_layers * seq_len * kv_dim * 4)
 	s_val_cache = alloc(n_layers * seq_len * kv_dim * 4)
-	s_xq = alloc(dim * 4)
+	s_xq = alloc(dim)
 	s_xq_s = alloc((dim / gs) * 4)
-	s_hq = alloc(hidden_dim * 4)
+	s_hq = alloc(hidden_dim)
 	s_hq_s = alloc((hidden_dim / gs) * 4)
 }
 
@@ -205,35 +210,24 @@ func quantize_act(xq, xs, x, n) {
 		while i < gs {
 			q := 0
 			if scale > 0.0 { q = int(round(peek_f32(x, (base+i)*4) / scale)) }
-			poke_i32(xq, (base+i)*4, q)
+			poke_u8(xq, base+i, q & 255)
 			i = i + 1
 		}
 		g = g + 1
 	}
 }
 
-// xout[d] = W(int8)[d,n] @ xq[n], group-scaled (runq.c matmul)
+// xout[lo..hi) = W(int8)[d,n] @ xq[n], group-scaled (runq.c matmul)
 // wq = q base offset, ws = scale base offset (bytes into wbuf)
-func matmul_q(xout, xq, xs, wq, ws, n, d) {
-	i := 0
-	while i < d {
+func matmul_q(xout, xq, xs, wq, ws, n, lo, hi) {
+	i := lo
+	while i < hi {
 		val := 0.0
 		in := i * n
 		wrow := wbuf + wq + in
 		j := 0
 		while j < n {
-			ival := 0
-			wg := wrow + j
-			xg := xq + j * 4
-			k := 0
-			while k < gs {
-				w4 := peek_i32(wg, k)
-				ival = ival + peek_i32(xg, k*4) * (((w4 & 255) ^ 128) - 128)
-				ival = ival + peek_i32(xg, k*4+4) * ((((w4 >> 8) & 255) ^ 128) - 128)
-				ival = ival + peek_i32(xg, k*4+8) * ((((w4 >> 16) & 255) ^ 128) - 128)
-				ival = ival + peek_i32(xg, k*4+12) * ((((w4 >> 24) & 255) ^ 128) - 128)
-				k = k + 4
-			}
+			ival := dot_i8(xq + j, wrow + j, gs)
 			val = val + float(ival) * peek_f32(wbuf, ws + ((in+j)/gs)*4) * peek_f32(xs, (j/gs)*4)
 			j = j + gs
 		}
@@ -242,17 +236,214 @@ func matmul_q(xout, xq, xs, wq, ws, n, d) {
 	}
 }
 
+// int4 variant: 32-byte groups, byte i holds q[k=i] (low nibble) and q[k=i+32]
+// (high nibble), each stored as q+8. Two uniform half-group loops so the
+// nibble unpack autovectorizes.
+func matmul_q4(xout, xq, xs, wq, ws, n, lo, hi, sc) {
+	h := gs / 2
+	i := lo
+	while i < hi {
+		// pass 1: unpack the whole int4 row into the worker's i8 scratch
+		wrow := wbuf + wq + i * (n / 2)
+		g := 0
+		while g < n / gs {
+			wg := wrow + g * h
+			sg := sc + g * gs
+			k := 0
+			while k < h {
+				b := peek_u8(wg, k)
+				poke_u8(sg, k, ((b & 15) - 8) & 255)
+				poke_u8(sg, k + h, ((b >> 4) - 8) & 255)
+				k = k + 1
+			}
+			g = g + 1
+		}
+		// pass 2: same i8 dot as the int8 kernel, reading from L1 scratch
+		val := 0.0
+		in := i * n
+		j := 0
+		while j < n {
+			ival := dot_i8(xq + j, sc + j, gs)
+			val = val + float(ival) * peek_f32(wbuf, ws + ((in+j)/gs)*4) * peek_f32(xs, (j/gs)*4)
+			j = j + gs
+		}
+		poke_f32(xout, i*4, val)
+		i = i + 1
+	}
+}
+
+// quant-width dispatch: tensor base tb, logical element count tsize, input width n
+func mmj(xout, xq, xs, tb, tsize, n, lo, hi, sc) {
+	if quant4 == 1 { matmul_q4(xout, xq, xs, tb, tb + wsz(tsize), n, lo, hi, sc) } else { matmul_q(xout, xq, xs, tb, tb + wsz(tsize), n, lo, hi) }
+}
+
 // dequantize one token-embedding row into x (runq dequantizes whole table; same math per element)
 func embed_token(token) {
 	row := token * dim
-	sbase := w_tok + vocab_size * dim // scales sit after all q bytes
+	sbase := w_tok + wsz(vocab_size * dim) // scales sit after the packed q bytes
+	if quant4 == 1 {
+		h := gs / 2
+		g := 0
+		while g < dim / gs {
+			gq := w_tok + token * (dim / 2) + g * h
+			sc := peek_f32(wbuf, sbase + ((row + g*gs)/gs)*4)
+			i := 0
+			while i < h {
+				b := peek_u8(wbuf, gq + i)
+				poke_f32(s_x, (g*gs+i)*4, float((b & 15) - 8) * sc)
+				poke_f32(s_x, (g*gs+i+h)*4, float((b >> 4) - 8) * sc)
+				i = i + 1
+			}
+			g = g + 1
+		}
+		return
+	}
 	i := 0
 	while i < dim {
-		q := peek_i32(wbuf, w_tok + row + i) & 255
-		q = (q ^ 128) - 128
-		poke_f32(s_x, i*4, float(q) * peek_f32(wbuf, sbase + ((row+i)/gs)*4))
+		poke_f32(s_x, i*4, float(peek_i8(wbuf, w_tok + row + i)) * peek_f32(wbuf, sbase + ((row+i)/gs)*4))
 		i = i + 1
 	}
+}
+
+// RoPE: rotate adjacent pairs of q (all dims) and this position's cached k (kv dims)
+func rope(l, pos) {
+	kptr := s_key_cache + (l * seq_len * kv_dim + pos * kv_dim) * 4
+	i := 0
+	while i < dim {
+		hd := i % head_size
+		freq := 1.0 / pow(10000.0, float(hd) / float(head_size))
+		val := float(pos) * freq
+		fcr := cos(val)
+		fci := sin(val)
+		q0 := peek_f32(s_q, i*4)
+		q1 := peek_f32(s_q, i*4+4)
+		poke_f32(s_q, i*4, q0 * fcr - q1 * fci)
+		poke_f32(s_q, i*4+4, q0 * fci + q1 * fcr)
+		if i < kv_dim {
+			k0 := peek_f32(kptr, i*4)
+			k1 := peek_f32(kptr, i*4+4)
+			poke_f32(kptr, i*4, k0 * fcr - k1 * fci)
+			poke_f32(kptr, i*4+4, k0 * fci + k1 * fcr)
+		}
+		i = i + 2
+	}
+}
+
+// one attention head over the kv cache: scores -> softmax -> weighted V sum into s_xb
+func attn_head(h, l, pos) {
+	loff := l * seq_len * kv_dim
+	kv_mul := n_heads / n_kv_heads
+	qh := s_q + h * head_size * 4
+	atth := s_att + h * seq_len * 4
+	t := 0
+	while t <= pos {
+		kt := s_key_cache + (loff + t * kv_dim + (h / kv_mul) * head_size) * 4
+		score := 0.0
+		j := 0
+		while j < head_size {
+			score = score + peek_f32(qh, j*4) * peek_f32(kt, j*4)
+			j = j + 1
+		}
+		poke_f32(atth, t*4, score / sqrt(float(head_size)))
+		t = t + 1
+	}
+	softmax(atth, pos + 1)
+	xbh := s_xb + h * head_size * 4
+	j := 0
+	while j < head_size {
+		poke_f32(xbh, j*4, 0.0)
+		j = j + 1
+	}
+	t = 0
+	while t <= pos {
+		vt := s_val_cache + (loff + t * kv_dim + (h / kv_mul) * head_size) * 4
+		a := peek_f32(atth, t*4)
+		j = 0
+		while j < head_size {
+			poke_f32(xbh, j*4, peek_f32(xbh, j*4) + a * peek_f32(vt, j*4))
+			j = j + 1
+		}
+		t = t + 1
+	}
+}
+
+// ---- worker pool: jobs are packed ints, results land in disjoint buffer rows ----
+// job = type | layer<<4 | pos<<12 | lo<<24 | hi<<44
+// types: 0 wq  1 wk  2 wv  3 wo  4 w1  5 w3  6 w2  7 wcls  8 attention heads
+var n_workers = 1
+var jobs = make(chan int)
+var done = make(chan int)
+var pending = 0
+
+func do_job(j, sc) {
+	t := j & 15
+	l := (j >> 4) & 255
+	pos := (j >> 12) & 4095
+	lo := (j >> 24) & 1048575
+	hi := j >> 44
+	if t == 0 { mmj(s_q, s_xq, s_xq_s, wq_b + l * qblock(dim*dim), dim*dim, dim, lo, hi, sc) }
+	if t == 1 {
+		kptr := s_key_cache + (l * seq_len * kv_dim + pos * kv_dim) * 4
+		mmj(kptr, s_xq, s_xq_s, wk_b + l * qblock(dim*kv_dim), dim*kv_dim, dim, lo, hi, sc)
+	}
+	if t == 2 {
+		vptr := s_val_cache + (l * seq_len * kv_dim + pos * kv_dim) * 4
+		mmj(vptr, s_xq, s_xq_s, wv_b + l * qblock(dim*kv_dim), dim*kv_dim, dim, lo, hi, sc)
+	}
+	if t == 3 { mmj(s_xb2, s_xq, s_xq_s, wo_b + l * qblock(dim*dim), dim*dim, dim, lo, hi, sc) }
+	if t == 4 { mmj(s_hb, s_xq, s_xq_s, w1_b + l * qblock(dim*hidden_dim), dim*hidden_dim, dim, lo, hi, sc) }
+	if t == 5 { mmj(s_hb2, s_xq, s_xq_s, w3_b + l * qblock(dim*hidden_dim), dim*hidden_dim, dim, lo, hi, sc) }
+	if t == 6 { mmj(s_xb, s_hq, s_hq_s, w2_b + l * qblock(hidden_dim*dim), hidden_dim*dim, hidden_dim, lo, hi, sc) }
+	if t == 7 { mmj(s_logits, s_xq, s_xq_s, wcls_b, dim*vocab_size, dim, lo, hi, sc) }
+	if t == 8 {
+		h := lo
+		while h < hi { attn_head(h, l, pos)  h = h + 1 }
+	}
+	if t == 9 { // fused qkv: this worker's rows of q, plus the matching k/v shares
+		mmj(s_q, s_xq, s_xq_s, wq_b + l * qblock(dim*dim), dim*dim, dim, lo, hi, sc)
+		klo := (lo * kv_dim) / dim
+		khi := (hi * kv_dim) / dim
+		if khi > klo {
+			kptr := s_key_cache + (l * seq_len * kv_dim + pos * kv_dim) * 4
+			vptr := s_val_cache + (l * seq_len * kv_dim + pos * kv_dim) * 4
+			mmj(kptr, s_xq, s_xq_s, wk_b + l * qblock(dim*kv_dim), dim*kv_dim, dim, klo, khi, sc)
+			mmj(vptr, s_xq, s_xq_s, wv_b + l * qblock(dim*kv_dim), dim*kv_dim, dim, klo, khi, sc)
+		}
+	}
+	if t == 10 { // fused ffn up: w1 and w3 share the same rows
+		mmj(s_hb, s_xq, s_xq_s, w1_b + l * qblock(dim*hidden_dim), dim*hidden_dim, dim, lo, hi, sc)
+		mmj(s_hb2, s_xq, s_xq_s, w3_b + l * qblock(dim*hidden_dim), dim*hidden_dim, dim, lo, hi, sc)
+	}
+}
+
+func worker(jc, dc) {
+	sc := alloc(hidden_dim) // per-worker int4 row-unpack scratch (covers widest row)
+	for j := range jc {
+		do_job(j, sc)
+		dc <- 1
+	}
+}
+
+// split rows [0,d) into n_workers chunks and enqueue with a sliding window:
+// never more than n_workers jobs outstanding (unbuffered channels — a bigger
+// backlog would deadlock: workers block on done<-, main on jobs<-)
+func dispatch(t, l, pos, d) {
+	nc := n_workers
+	if nc > d { nc = d }
+	chunk := (d + nc - 1) / nc
+	lo := 0
+	while lo < d {
+		hi := lo + chunk
+		if hi > d { hi = d }
+		if pending >= n_workers { <-done  pending = pending - 1 }
+		jobs <- (t | l << 4 | pos << 12 | lo << 24 | hi << 44)
+		pending = pending + 1
+		lo = hi
+	}
+}
+
+func barrier() {
+	while pending > 0 { <-done  pending = pending - 1 }
 }
 
 func forward(token, pos) {
@@ -261,74 +452,13 @@ func forward(token, pos) {
 	l := 0
 	while l < n_layers {
 		rmsnorm(s_xb, s_x, wbuf + w_rms_att + l * dim * 4, dim)
-		loff := l * seq_len * kv_dim
-		kptr := s_key_cache + (loff + pos * kv_dim) * 4
-		vptr := s_val_cache + (loff + pos * kv_dim) * 4
 		quantize_act(s_xq, s_xq_s, s_xb, dim)
-		matmul_q(s_q, s_xq, s_xq_s, wq_b + l * qblock(dim*dim), wq_b + l * qblock(dim*dim) + dim*dim, dim, dim)
-		matmul_q(kptr, s_xq, s_xq_s, wk_b + l * qblock(dim*kv_dim), wk_b + l * qblock(dim*kv_dim) + dim*kv_dim, dim, kv_dim)
-		matmul_q(vptr, s_xq, s_xq_s, wv_b + l * qblock(dim*kv_dim), wv_b + l * qblock(dim*kv_dim) + dim*kv_dim, dim, kv_dim)
-		// RoPE
-		i = 0
-		while i < dim {
-			hd := i % head_size
-			freq := 1.0 / pow(10000.0, float(hd) / float(head_size))
-			val := float(pos) * freq
-			fcr := cos(val)
-			fci := sin(val)
-			q0 := peek_f32(s_q, i*4)
-			q1 := peek_f32(s_q, i*4+4)
-			poke_f32(s_q, i*4, q0 * fcr - q1 * fci)
-			poke_f32(s_q, i*4+4, q0 * fci + q1 * fcr)
-			if i < kv_dim {
-				k0 := peek_f32(kptr, i*4)
-				k1 := peek_f32(kptr, i*4+4)
-				poke_f32(kptr, i*4, k0 * fcr - k1 * fci)
-				poke_f32(kptr, i*4+4, k0 * fci + k1 * fcr)
-			}
-			i = i + 2
-		}
-		// multihead attention over the kv cache
-		kv_mul := n_heads / n_kv_heads
-		h := 0
-		while h < n_heads {
-			qh := s_q + h * head_size * 4
-			atth := s_att + h * seq_len * 4
-			t := 0
-			while t <= pos {
-				kt := s_key_cache + (loff + t * kv_dim + (h / kv_mul) * head_size) * 4
-				score := 0.0
-				j := 0
-				while j < head_size {
-					score = score + peek_f32(qh, j*4) * peek_f32(kt, j*4)
-					j = j + 1
-				}
-				poke_f32(atth, t*4, score / sqrt(float(head_size)))
-				t = t + 1
-			}
-			softmax(atth, pos + 1)
-			xbh := s_xb + h * head_size * 4
-			j := 0
-			while j < head_size {
-				poke_f32(xbh, j*4, 0.0)
-				j = j + 1
-			}
-			t = 0
-			while t <= pos {
-				vt := s_val_cache + (loff + t * kv_dim + (h / kv_mul) * head_size) * 4
-				a := peek_f32(atth, t*4)
-				j = 0
-				while j < head_size {
-					poke_f32(xbh, j*4, peek_f32(xbh, j*4) + a * peek_f32(vt, j*4))
-					j = j + 1
-				}
-				t = t + 1
-			}
-			h = h + 1
-		}
+		dispatch(9, l, pos, dim)  barrier()
+		rope(l, pos)
+		dispatch(8, l, pos, n_heads)  barrier()
 		// attention out projection + residual
 		quantize_act(s_xq, s_xq_s, s_xb, dim)
-		matmul_q(s_xb2, s_xq, s_xq_s, wo_b + l * qblock(dim*dim), wo_b + l * qblock(dim*dim) + dim*dim, dim, dim)
+		dispatch(3, l, pos, dim)  barrier()
 		i = 0
 		while i < dim {
 			poke_f32(s_x, i*4, peek_f32(s_x, i*4) + peek_f32(s_xb2, i*4))
@@ -337,8 +467,7 @@ func forward(token, pos) {
 		// ffn
 		rmsnorm(s_xb, s_x, wbuf + w_rms_ffn + l * dim * 4, dim)
 		quantize_act(s_xq, s_xq_s, s_xb, dim)
-		matmul_q(s_hb, s_xq, s_xq_s, w1_b + l * qblock(dim*hidden_dim), w1_b + l * qblock(dim*hidden_dim) + dim*hidden_dim, dim, hidden_dim)
-		matmul_q(s_hb2, s_xq, s_xq_s, w3_b + l * qblock(dim*hidden_dim), w3_b + l * qblock(dim*hidden_dim) + dim*hidden_dim, dim, hidden_dim)
+		dispatch(10, l, pos, hidden_dim)  barrier()
 		i = 0
 		while i < hidden_dim {
 			v := peek_f32(s_hb, i*4)
@@ -347,7 +476,7 @@ func forward(token, pos) {
 			i = i + 1
 		}
 		quantize_act(s_hq, s_hq_s, s_hb, hidden_dim)
-		matmul_q(s_xb, s_hq, s_hq_s, w2_b + l * qblock(hidden_dim*dim), w2_b + l * qblock(hidden_dim*dim) + hidden_dim*dim, hidden_dim, dim)
+		dispatch(6, l, pos, dim)  barrier()
 		i = 0
 		while i < dim {
 			poke_f32(s_x, i*4, peek_f32(s_x, i*4) + peek_f32(s_xb, i*4))
@@ -357,8 +486,7 @@ func forward(token, pos) {
 	}
 	rmsnorm(s_x, s_x, wbuf + w_rms_final, dim)
 	quantize_act(s_xq, s_xq_s, s_x, dim)
-	cls_s := wcls_b + dim * vocab_size
-	matmul_q(s_logits, s_xq, s_xq_s, wcls_b, cls_s, dim, vocab_size)
+	dispatch(7, 0, pos, vocab_size)  barrier()
 }
 
 func argmax_logits() (best) {
@@ -436,10 +564,14 @@ func main() {
 	if len(a) > 1 { model = a[1] }
 	if len(a) > 2 { steps = parse_int(a[2]) }
 	if len(a) > 3 { prompt = a[3] }
+	nw := parse_int(env("COLIBRI_THREADS"))
+	if nw > 0 { n_workers = nw } else { n_workers = 8 }
 	t0 := now_ms()
 	load_model(model)
 	alloc_state()
 	load_tokenizer("models/tokenizer.bin")
+	w := 0
+	while w < n_workers { go worker(jobs, done)  w = w + 1 }
 	t1 := now_ms()
 	println("loaded: dim=" + str(dim) + " hidden=" + str(hidden_dim) + " layers=" + str(n_layers) + " heads=" + str(n_heads) + " kv_heads=" + str(n_kv_heads) + " vocab=" + str(vocab_size) + " seq=" + str(seq_len) + " gs=" + str(gs) + " shared_cls=" + str(shared_cls) + " (" + str(t1 - t0) + " ms)")
 	if steps > seq_len { steps = seq_len }
