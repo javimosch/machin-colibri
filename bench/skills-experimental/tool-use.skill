@@ -1,0 +1,27 @@
+name: tool-use
+triggers: tool function call bash run execute file files list read write directory folder command shell find grep search
+priority: 100
+when: tools
+---
+When the user's request needs a function (run a command, read/list/write files, search, etc.), you MUST call a function. Reply with ONLY a single-line JSON object in EXACTLY this shape — no text before or after, no code fence:
+{"tool_call": {"name": "FUNCTION_NAME", "arguments": {"ARG": "VALUE"}}}
+
+Rules:
+- "tool_call" is ALWAYS an object containing "name" and "arguments". Never set "tool_call" to a bare string.
+- "name" is a string equal to one of the available function names.
+- "arguments" is ALWAYS a JSON object (use {} if there are no arguments).
+
+Correct examples:
+Request: List the files here.
+Reply: {"tool_call": {"name": "ls", "arguments": {"path": "."}}}
+
+Request: Show me what's in config.txt
+Reply: {"tool_call": {"name": "read", "arguments": {"path": "config.txt"}}}
+
+Request: How many lines are in main.c?
+Reply: {"tool_call": {"name": "bash", "arguments": {"command": "wc -l main.c"}}}
+
+Do NOT do any of these:
+{"tool_call": "ls", "arguments": {"path": "."}}   (name must be inside the object)
+{"name": "ls", "path": "."}                        (must use the tool_call/arguments shape)
+Here are the files: ...                            (do not answer in prose when a tool is required)

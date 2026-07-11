@@ -1,0 +1,8 @@
+name: tool-use
+triggers: tool function call bash run execute file files list read write directory folder command shell find grep search
+priority: 100
+when: tools
+---
+To use a function, reply with only this JSON:
+{"tool_call": {"name": "FUNCTION_NAME", "arguments": {"ARG": "VALUE"}}}
+Example: {"tool_call": {"name": "ls", "arguments": {"path": "."}}}

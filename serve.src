@@ -44,6 +44,104 @@ var model_id = "tinyllama-1.1b-q80"
 var mu_acq = make(chan int)
 var mu_rel = make(chan int)
 
+// ---- skills: trigger-matched guidance injected into the system prompt.
+// In-context "finetuning": curated instructions + few-shot examples make the
+// small model far more reliable at a task, without changing its weights.
+type Skill struct {
+	name string
+	triggers []string
+	priority int
+	when string   // "tools" = only inject when the request carries tools; "" = always eligible
+	body string
+}
+var skills = []Skill{}
+var skills_max = 2 // inject at most this many matched skills
+
+func parse_skill(content) (sk) {
+	sk = Skill{name: "", priority: 0, when: "", body: ""}
+	trg := []string{}
+	sep := index(content, "\n---")
+	head := content
+	if sep >= 0 { head = substr(content, 0, sep)  sk.body = trim(substr(content, sep+4, len(content))) }
+	lines := split(head, "\n")
+	i := 0
+	while i < len(lines) {
+		ln := trim(lines[i])
+		if has_prefix(ln, "name:") { sk.name = trim(substr(ln, 5, len(ln))) }
+		if has_prefix(ln, "priority:") { sk.priority = parse_int(trim(substr(ln, 9, len(ln)))) }
+		if has_prefix(ln, "when:") { sk.when = trim(substr(ln, 5, len(ln))) }
+		if has_prefix(ln, "triggers:") { trg = split(trim(substr(ln, 9, len(ln))), " ") }
+		i = i + 1
+	}
+	sk.triggers = trg
+	return
+}
+
+func load_skills(dir) {
+	files := list_dir(dir)
+	s := []Skill{}
+	i := 0
+	while i < len(files) {
+		if has_suffix(files[i], ".skill") {
+			c := read_file(dir + "/" + files[i])
+			if len(c) > 0 { s = append(s, parse_skill(c)) }
+		}
+		i = i + 1
+	}
+	skills = s
+}
+
+// score a skill against lowercased request text: +priority-weighted per trigger hit
+func skill_score(sk, low) (sc) {
+	sc = 0
+	i := 0
+	while i < len(sk.triggers) {
+		t := sk.triggers[i]
+		if len(t) > 0 && contains(low, t) { sc = sc + 1 }
+		i = i + 1
+	}
+	return
+}
+
+// select the top matched skills for a request; returns their concatenated bodies.
+// ctx gates by context: skills declaring when:tools need tools_present, when:
+// tool_result need a prior tool-result turn.
+func match_skills(usertext, tools_present, tool_result_present) (out) {
+	out = ""
+	if len(skills) == 0 { return }
+	low := to_lower(usertext)
+	// score all, pick top skills_max with score>0 (priority breaks ties)
+	picked := []int{}
+	used := make(map[int]int)
+	k := 0
+	while k < skills_max {
+		best := -1
+		bestv := 0
+		i := 0
+		while i < len(skills) {
+			eligible := 1
+			if skills[i].when == "tools" && tools_present == false { eligible = 0 }
+			if skills[i].when == "tool_result" && tool_result_present == false { eligible = 0 }
+			if has(used, i) == false && eligible == 1 {
+				sc := skill_score(skills[i], low) * 1000 + skills[i].priority
+				hit := skill_score(skills[i], low)
+				if hit > 0 && sc > bestv { bestv = sc  best = i }
+			}
+			i = i + 1
+		}
+		if best < 0 { break }
+		used[best] = 1
+		picked = append(picked, best)
+		k = k + 1
+	}
+	i := 0
+	while i < len(picked) {
+		out = out + "\n\n## Skill: " + skills[picked[i]].name + "\n" + skills[picked[i]].body + "\n"
+		i = i + 1
+	}
+	return
+}
+
 func mutex_srv(acq, rel) {
 	while true {
 		acq <- 1
@@ -168,7 +266,22 @@ func tools_prompt(tools, body) (s) {
 func prep_messages(cr) (out) {
 	out = []ChatMsg{}
 	inject := ""
-	if len(cr.tools) > 0 { inject = tools_prompt(cr.tools, cr.reqbody) }
+	// skills: match on the last user message, inject guidance BEFORE tool schema
+	last_user := ""
+	ui := len(cr.messages) - 1
+	while ui >= 0 {
+		if cr.messages[ui].role == "user" { last_user = cr.messages[ui].content  break }
+		ui = ui - 1
+	}
+	tres := 0
+	ti := 0
+	while ti < len(cr.messages) {
+		if cr.messages[ti].role == "tool" { tres = 1  break }
+		ti = ti + 1
+	}
+	sk := match_skills(last_user, len(cr.tools) > 0, tres == 1)
+	if len(sk) > 0 { inject = inject + sk }
+	if len(cr.tools) > 0 { inject = inject + tools_prompt(cr.tools, cr.reqbody) }
 	sys_done := 0
 	i := 0
 	while i < len(cr.messages) {
@@ -381,10 +494,16 @@ func main() {
 	alloc_state()
 	load_tokenizer_auto()
 	if tok_l3 == 1 { model_id = "llama-3.2-1b-instruct-q80" }
+	// skills are OPT-IN (COLIBRI_SKILLS=<dir>): measured to HURT reliability on
+	// the 1B baseline (see bench/SKILLS-EVAL.md — the M6 prompt+parser already
+	// saturate tool reliability, so extra context only adds drift). The mechanism
+	// ships for weaker baselines / bigger models; default is no skills.
+	skills_dir := env("COLIBRI_SKILLS")
+	if len(skills_dir) > 0 { load_skills(skills_dir) }
 	w := 0
 	while w < n_workers { go worker(jobs, done)  w = w + 1 }
 	go mutex_srv(mu_acq, mu_rel)
-	println("colibri serve: model=" + model_id + " dim=" + str(dim) + " layers=" + str(n_layers) + " workers=" + str(n_workers) + " loaded in " + str(now_ms() - t0) + " ms")
+	println("colibri serve: model=" + model_id + " dim=" + str(dim) + " layers=" + str(n_layers) + " workers=" + str(n_workers) + " skills=" + str(len(skills)) + " loaded in " + str(now_ms() - t0) + " ms")
 	println("OpenAI-compatible API on http://0.0.0.0:" + str(port) + "/v1")
 	serve(port, func(req) { return api_route(req) })
 }

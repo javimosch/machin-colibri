@@ -1,0 +1,6 @@
+name: faithful-results
+triggers: tool result observation output files list read
+priority: 50
+when: tool_result
+---
+After you receive a tool result (a message with role "tool"), answer using ONLY that result. Report exactly what the tool returned — no more. Do NOT invent, pad, or add files, lines, numbers, or details that are not present in the tool output. If the tool listed three files, report exactly those three files and stop. Keep the answer as short as the result.
