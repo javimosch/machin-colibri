@@ -1,6 +1,8 @@
 # colibri
 
-A clean-room LLM inference engine in **pure MFL** ([machin](https://github.com/javimosch/machin)) — zero dependencies, no Python at runtime. Inspired by the philosophy of [JustVugg/colibri](https://github.com/JustVugg/colibri) (single small engine, quantized, self-contained), aimed at small models instead of giant MoEs.
+A clean-room LLM inference engine in **pure MFL** ([machin](https://github.com/javimosch/machin), the machine-first language — see [awesome-machin](https://github.com/javimosch/awesome-machin)) — zero dependencies, no Python at runtime. Inspired by the philosophy of [JustVugg/colibri](https://github.com/JustVugg/colibri) (single small engine, quantized, self-contained), aimed at small models instead of giant MoEs.
+
+Full story: [blog.intrane.fr — the 20 tok/s challenge](https://blog.intrane.fr/a-1b-llm-at-20-tokens-per-second-in-pure-machin).
 
 **The challenge:** run a 1B-parameter model on CPU at **20+ tok/s**, matmul included, in MFL.
 
