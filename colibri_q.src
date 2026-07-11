@@ -1,0 +1,471 @@
+// colibri_q — pure-MFL int8 (Q8_0) LLM inference engine (M1)
+// Reads llama2.c "version 2" checkpoints (magic ak42): group-quantized int8
+// weights + fp32 group scales, fp32 rmsnorm params. Mirrors runq.c faithfully.
+
+// ---- config ----
+var dim = 0
+var hidden_dim = 0
+var n_layers = 0
+var n_heads = 0
+var n_kv_heads = 0
+var vocab_size = 0
+var seq_len = 0
+var head_size = 0
+var kv_dim = 0
+var gs = 0
+var shared_cls = 0
+
+// ---- weight offsets into the checkpoint buffer (bytes) ----
+var wbuf = 0
+var w_rms_att = 0
+var w_rms_ffn = 0
+var w_rms_final = 0
+// quantized tensor bases; per-layer block = size + 4*size/gs (q bytes then f32 scales)
+var w_tok = 0
+var wq_b = 0
+var wk_b = 0
+var wv_b = 0
+var wo_b = 0
+var w1_b = 0
+var w2_b = 0
+var w3_b = 0
+var wcls_b = 0
+
+// ---- run state ----
+var s_x = 0
+var s_xb = 0
+var s_xb2 = 0
+var s_hb = 0
+var s_hb2 = 0
+var s_q = 0
+var s_att = 0
+var s_logits = 0
+var s_key_cache = 0
+var s_val_cache = 0
+var s_xq = 0    // quantized activation values (int32 slots for speed)
+var s_xq_s = 0  // fp32 group scales
+var s_hq = 0
+var s_hq_s = 0
+
+// ---- tokenizer ----
+var vocab = []string{}
+var vocab_idx = make(map[string]int)
+var tok_scores = 0 // raw buffer of fp32 scores
+
+func read_i32(b, off) (v) {
+	v = byte_at(b, off) | byte_at(b, off+1) << 8 | byte_at(b, off+2) << 16 | byte_at(b, off+3) << 24
+	if v >= 2147483648 { v = v - 4294967296 }
+	return
+}
+
+func bytes_to_buf(b) (p) {
+	n := len(b)
+	p = alloc(n + 4)
+	i := 0
+	while i + 4 <= n {
+		w := byte_at(b, i) | byte_at(b, i+1) << 8 | byte_at(b, i+2) << 16 | byte_at(b, i+3) << 24
+		poke_i32(p, i, w)
+		i = i + 4
+	}
+	while i < n { poke_u8(p, i, byte_at(b, i))  i = i + 1 }
+	return
+}
+
+// quantized tensor block size in bytes: size int8 values + size/gs fp32 scales
+func qblock(size) (n) { n = size + 4 * (size / gs)  return }
+
+func load_model(path) {
+	b := read_file_bytes(path)
+	if len(b) == 0 { println("cannot read model: " + path)  exit(1) }
+	if read_i32(b, 0) != 1634415666 { println("bad magic (want ak42/version2 checkpoint)")  exit(1) } // 0x616b3432
+	if read_i32(b, 4) != 2 { println("bad version: " + str(read_i32(b, 4)))  exit(1) }
+	dim = read_i32(b, 8)
+	hidden_dim = read_i32(b, 12)
+	n_layers = read_i32(b, 16)
+	n_heads = read_i32(b, 20)
+	n_kv_heads = read_i32(b, 24)
+	vocab_size = read_i32(b, 28)
+	seq_len = read_i32(b, 32)
+	shared_cls = byte_at(b, 36)
+	gs = read_i32(b, 37)
+	head_size = dim / n_heads
+	kv_dim = (dim * n_kv_heads) / n_heads
+	wbuf = bytes_to_buf(b)
+	o := 256
+	w_rms_att = o    o = o + n_layers * dim * 4
+	w_rms_ffn = o    o = o + n_layers * dim * 4
+	w_rms_final = o  o = o + dim * 4
+	w_tok = o        o = o + qblock(vocab_size * dim)
+	wq_b = o         o = o + n_layers * qblock(dim * dim)
+	wk_b = o         o = o + n_layers * qblock(dim * kv_dim)
+	wv_b = o         o = o + n_layers * qblock(dim * kv_dim)
+	wo_b = o         o = o + n_layers * qblock(dim * dim)
+	w1_b = o         o = o + n_layers * qblock(dim * hidden_dim)
+	w2_b = o         o = o + n_layers * qblock(hidden_dim * dim)
+	w3_b = o         o = o + n_layers * qblock(dim * hidden_dim)
+	if shared_cls == 1 { wcls_b = w_tok } else { wcls_b = o }
+}
+
+func alloc_state() {
+	s_x = alloc(dim * 4)
+	s_xb = alloc(dim * 4)
+	s_xb2 = alloc(dim * 4)
+	s_hb = alloc(hidden_dim * 4)
+	s_hb2 = alloc(hidden_dim * 4)
+	s_q = alloc(dim * 4)
+	s_att = alloc(n_heads * seq_len * 4)
+	s_logits = alloc(vocab_size * 4)
+	s_key_cache = alloc(n_layers * seq_len * kv_dim * 4)
+	s_val_cache = alloc(n_layers * seq_len * kv_dim * 4)
+	s_xq = alloc(dim * 4)
+	s_xq_s = alloc((dim / gs) * 4)
+	s_hq = alloc(hidden_dim * 4)
+	s_hq_s = alloc((hidden_dim / gs) * 4)
+}
+
+func load_tokenizer(path) {
+	b := read_file_bytes(path)
+	if len(b) == 0 { println("cannot read tokenizer: " + path)  exit(1) }
+	tbuf := bytes_to_buf(b)
+	tok_scores = alloc(vocab_size * 4)
+	off := 4
+	i := 0
+	while i < vocab_size {
+		poke_f32(tok_scores, i*4, peek_f32(tbuf, off))
+		off = off + 4
+		n := read_i32(b, off)
+		off = off + 4
+		piece := bytes_str(bytes_sub(b, off, off+n))
+		vocab = append(vocab, piece)
+		vocab_idx[piece] = i
+		off = off + n
+		i = i + 1
+	}
+	free(tbuf)
+}
+
+// ---- math kernels ----
+
+func rmsnorm(dst, x, w, size) {
+	ss := 0.0
+	j := 0
+	while j < size {
+		v := peek_f32(x, j*4)
+		ss = ss + v * v
+		j = j + 1
+	}
+	ss = ss / float(size)
+	ss = 1.0 / sqrt(ss + 0.00001)
+	j = 0
+	while j < size {
+		poke_f32(dst, j*4, peek_f32(w, j*4) * ss * peek_f32(x, j*4))
+		j = j + 1
+	}
+}
+
+func softmax(x, size) {
+	mx := peek_f32(x, 0)
+	i := 1
+	while i < size {
+		v := peek_f32(x, i*4)
+		if v > mx { mx = v }
+		i = i + 1
+	}
+	sum := 0.0
+	i = 0
+	while i < size {
+		e := exp(peek_f32(x, i*4) - mx)
+		poke_f32(x, i*4, e)
+		sum = sum + e
+		i = i + 1
+	}
+	i = 0
+	while i < size {
+		poke_f32(x, i*4, peek_f32(x, i*4) / sum)
+		i = i + 1
+	}
+}
+
+// quantize fp32 buffer x[n] into int32-slot quants xq + fp32 group scales xs (runq.c quantize)
+func quantize_act(xq, xs, x, n) {
+	ng := n / gs
+	g := 0
+	while g < ng {
+		base := g * gs
+		wmax := 0.0
+		i := 0
+		while i < gs {
+			v := abs(peek_f32(x, (base+i)*4))
+			if v > wmax { wmax = v }
+			i = i + 1
+		}
+		scale := wmax / 127.0
+		poke_f32(xs, g*4, scale)
+		i = 0
+		while i < gs {
+			q := 0
+			if scale > 0.0 { q = int(round(peek_f32(x, (base+i)*4) / scale)) }
+			poke_i32(xq, (base+i)*4, q)
+			i = i + 1
+		}
+		g = g + 1
+	}
+}
+
+// xout[d] = W(int8)[d,n] @ xq[n], group-scaled (runq.c matmul)
+// wq = q base offset, ws = scale base offset (bytes into wbuf)
+func matmul_q(xout, xq, xs, wq, ws, n, d) {
+	i := 0
+	while i < d {
+		val := 0.0
+		in := i * n
+		wrow := wbuf + wq + in
+		j := 0
+		while j < n {
+			ival := 0
+			wg := wrow + j
+			xg := xq + j * 4
+			k := 0
+			while k < gs {
+				w4 := peek_i32(wg, k)
+				ival = ival + peek_i32(xg, k*4) * (((w4 & 255) ^ 128) - 128)
+				ival = ival + peek_i32(xg, k*4+4) * ((((w4 >> 8) & 255) ^ 128) - 128)
+				ival = ival + peek_i32(xg, k*4+8) * ((((w4 >> 16) & 255) ^ 128) - 128)
+				ival = ival + peek_i32(xg, k*4+12) * ((((w4 >> 24) & 255) ^ 128) - 128)
+				k = k + 4
+			}
+			val = val + float(ival) * peek_f32(wbuf, ws + ((in+j)/gs)*4) * peek_f32(xs, (j/gs)*4)
+			j = j + gs
+		}
+		poke_f32(xout, i*4, val)
+		i = i + 1
+	}
+}
+
+// dequantize one token-embedding row into x (runq dequantizes whole table; same math per element)
+func embed_token(token) {
+	row := token * dim
+	sbase := w_tok + vocab_size * dim // scales sit after all q bytes
+	i := 0
+	while i < dim {
+		q := peek_i32(wbuf, w_tok + row + i) & 255
+		q = (q ^ 128) - 128
+		poke_f32(s_x, i*4, float(q) * peek_f32(wbuf, sbase + ((row+i)/gs)*4))
+		i = i + 1
+	}
+}
+
+func forward(token, pos) {
+	embed_token(token)
+	i := 0
+	l := 0
+	while l < n_layers {
+		rmsnorm(s_xb, s_x, wbuf + w_rms_att + l * dim * 4, dim)
+		loff := l * seq_len * kv_dim
+		kptr := s_key_cache + (loff + pos * kv_dim) * 4
+		vptr := s_val_cache + (loff + pos * kv_dim) * 4
+		quantize_act(s_xq, s_xq_s, s_xb, dim)
+		matmul_q(s_q, s_xq, s_xq_s, wq_b + l * qblock(dim*dim), wq_b + l * qblock(dim*dim) + dim*dim, dim, dim)
+		matmul_q(kptr, s_xq, s_xq_s, wk_b + l * qblock(dim*kv_dim), wk_b + l * qblock(dim*kv_dim) + dim*kv_dim, dim, kv_dim)
+		matmul_q(vptr, s_xq, s_xq_s, wv_b + l * qblock(dim*kv_dim), wv_b + l * qblock(dim*kv_dim) + dim*kv_dim, dim, kv_dim)
+		// RoPE
+		i = 0
+		while i < dim {
+			hd := i % head_size
+			freq := 1.0 / pow(10000.0, float(hd) / float(head_size))
+			val := float(pos) * freq
+			fcr := cos(val)
+			fci := sin(val)
+			q0 := peek_f32(s_q, i*4)
+			q1 := peek_f32(s_q, i*4+4)
+			poke_f32(s_q, i*4, q0 * fcr - q1 * fci)
+			poke_f32(s_q, i*4+4, q0 * fci + q1 * fcr)
+			if i < kv_dim {
+				k0 := peek_f32(kptr, i*4)
+				k1 := peek_f32(kptr, i*4+4)
+				poke_f32(kptr, i*4, k0 * fcr - k1 * fci)
+				poke_f32(kptr, i*4+4, k0 * fci + k1 * fcr)
+			}
+			i = i + 2
+		}
+		// multihead attention over the kv cache
+		kv_mul := n_heads / n_kv_heads
+		h := 0
+		while h < n_heads {
+			qh := s_q + h * head_size * 4
+			atth := s_att + h * seq_len * 4
+			t := 0
+			while t <= pos {
+				kt := s_key_cache + (loff + t * kv_dim + (h / kv_mul) * head_size) * 4
+				score := 0.0
+				j := 0
+				while j < head_size {
+					score = score + peek_f32(qh, j*4) * peek_f32(kt, j*4)
+					j = j + 1
+				}
+				poke_f32(atth, t*4, score / sqrt(float(head_size)))
+				t = t + 1
+			}
+			softmax(atth, pos + 1)
+			xbh := s_xb + h * head_size * 4
+			j := 0
+			while j < head_size {
+				poke_f32(xbh, j*4, 0.0)
+				j = j + 1
+			}
+			t = 0
+			while t <= pos {
+				vt := s_val_cache + (loff + t * kv_dim + (h / kv_mul) * head_size) * 4
+				a := peek_f32(atth, t*4)
+				j = 0
+				while j < head_size {
+					poke_f32(xbh, j*4, peek_f32(xbh, j*4) + a * peek_f32(vt, j*4))
+					j = j + 1
+				}
+				t = t + 1
+			}
+			h = h + 1
+		}
+		// attention out projection + residual
+		quantize_act(s_xq, s_xq_s, s_xb, dim)
+		matmul_q(s_xb2, s_xq, s_xq_s, wo_b + l * qblock(dim*dim), wo_b + l * qblock(dim*dim) + dim*dim, dim, dim)
+		i = 0
+		while i < dim {
+			poke_f32(s_x, i*4, peek_f32(s_x, i*4) + peek_f32(s_xb2, i*4))
+			i = i + 1
+		}
+		// ffn
+		rmsnorm(s_xb, s_x, wbuf + w_rms_ffn + l * dim * 4, dim)
+		quantize_act(s_xq, s_xq_s, s_xb, dim)
+		matmul_q(s_hb, s_xq, s_xq_s, w1_b + l * qblock(dim*hidden_dim), w1_b + l * qblock(dim*hidden_dim) + dim*hidden_dim, dim, hidden_dim)
+		matmul_q(s_hb2, s_xq, s_xq_s, w3_b + l * qblock(dim*hidden_dim), w3_b + l * qblock(dim*hidden_dim) + dim*hidden_dim, dim, hidden_dim)
+		i = 0
+		while i < hidden_dim {
+			v := peek_f32(s_hb, i*4)
+			v = v * (1.0 / (1.0 + exp(0.0 - v)))
+			poke_f32(s_hb, i*4, v * peek_f32(s_hb2, i*4))
+			i = i + 1
+		}
+		quantize_act(s_hq, s_hq_s, s_hb, hidden_dim)
+		matmul_q(s_xb, s_hq, s_hq_s, w2_b + l * qblock(hidden_dim*dim), w2_b + l * qblock(hidden_dim*dim) + hidden_dim*dim, hidden_dim, dim)
+		i = 0
+		while i < dim {
+			poke_f32(s_x, i*4, peek_f32(s_x, i*4) + peek_f32(s_xb, i*4))
+			i = i + 1
+		}
+		l = l + 1
+	}
+	rmsnorm(s_x, s_x, wbuf + w_rms_final, dim)
+	quantize_act(s_xq, s_xq_s, s_x, dim)
+	cls_s := wcls_b + dim * vocab_size
+	matmul_q(s_logits, s_xq, s_xq_s, wcls_b, cls_s, dim, vocab_size)
+}
+
+func argmax_logits() (best) {
+	best = 0
+	bv := peek_f32(s_logits, 0)
+	i := 1
+	while i < vocab_size {
+		v := peek_f32(s_logits, i*4)
+		if v > bv { bv = v  best = i }
+		i = i + 1
+	}
+	return
+}
+
+// ---- BPE encode (llama2.c encode(): BOS + dummy prefix + char lookup + best-score merges) ----
+func bpe_encode(text) (toks) {
+	toks = []int{}
+	toks = append(toks, 1) // BOS
+	if len(text) == 0 { return }
+	toks = append(toks, vocab_idx[" "]) // sentencepiece dummy prefix
+	b := bytes(text)
+	n := len(b)
+	i := 0
+	while i < n {
+		j := i + 1
+		while j < n && (byte_at(b, j) & 192) == 128 { j = j + 1 }
+		c := bytes_str(bytes_sub(b, i, j))
+		if has(vocab_idx, c) {
+			toks = append(toks, vocab_idx[c])
+		} else {
+			k := i
+			while k < j { toks = append(toks, byte_at(b, k) + 3)  k = k + 1 }
+		}
+		i = j
+	}
+	while true {
+		best_score := 0.0 - 1000000000.0
+		best_id := -1
+		best_idx := -1
+		ti := 0
+		while ti < len(toks) - 1 {
+			merged := vocab[toks[ti]] + vocab[toks[ti+1]]
+			if has(vocab_idx, merged) {
+				id := vocab_idx[merged]
+				sc := peek_f32(tok_scores, id*4)
+				if sc > best_score { best_score = sc  best_id = id  best_idx = ti }
+			}
+			ti = ti + 1
+		}
+		if best_idx == -1 { break }
+		nt := []int{}
+		ti = 0
+		while ti < len(toks) {
+			if ti == best_idx { nt = append(nt, best_id)  ti = ti + 2 } else { nt = append(nt, toks[ti])  ti = ti + 1 }
+		}
+		toks = nt
+	}
+	return
+}
+
+func decode_piece(prev, token) (piece) {
+	piece = vocab[token]
+	if prev == 1 && has_prefix(piece, " ") { piece = substr(piece, 1, len(piece)) }
+	if has_prefix(piece, "<0x") && has_suffix(piece, ">") {
+		piece = bytes_str(from_hex(substr(piece, 3, 5)))
+	}
+	return
+}
+
+func main() {
+	a := args()
+	model := "models/tinyllama-1.1b-q80.bin"
+	steps := 64
+	prompt := ""
+	if len(a) > 1 { model = a[1] }
+	if len(a) > 2 { steps = parse_int(a[2]) }
+	if len(a) > 3 { prompt = a[3] }
+	t0 := now_ms()
+	load_model(model)
+	alloc_state()
+	load_tokenizer("models/tokenizer.bin")
+	t1 := now_ms()
+	println("loaded: dim=" + str(dim) + " hidden=" + str(hidden_dim) + " layers=" + str(n_layers) + " heads=" + str(n_heads) + " kv_heads=" + str(n_kv_heads) + " vocab=" + str(vocab_size) + " seq=" + str(seq_len) + " gs=" + str(gs) + " shared_cls=" + str(shared_cls) + " (" + str(t1 - t0) + " ms)")
+	if steps > seq_len { steps = seq_len }
+	ptoks := bpe_encode(prompt)
+	token := ptoks[0]
+	pos := 0
+	t2 := now_ms()
+	dl := env("DL")
+	while pos < steps {
+		forward(token, pos)
+		if len(dl) > 0 {
+			am := argmax_logits()
+			println("DL " + str(pos) + " tok=" + str(token) + " argmax=" + str(am) + " v=" + str(peek_f32(s_logits, am*4)) + " l0=" + str(peek_f32(s_logits, 0)) + " l1=" + str(peek_f32(s_logits, 4)) + " l2=" + str(peek_f32(s_logits, 8)))
+		}
+		next := 0
+		if pos < len(ptoks) - 1 { next = ptoks[pos+1] } else { next = argmax_logits() }
+		pos = pos + 1
+		if next == 1 || next == 2 { break } // BOS/EOS
+		print(decode_piece(token, next))
+		flush()
+		token = next
+	}
+	t3 := now_ms()
+	println("")
+	if t3 > t2 && pos > 0 {
+		tps := float(pos) * 1000.0 / float(t3 - t2)
+		println("tokens: " + str(pos) + "  time: " + str(t3 - t2) + " ms  tok/s: " + str(tps))
+	}
+}
