@@ -6,9 +6,26 @@
 // exclusive under the lock). Single-slot KV prefix cache makes multi-turn
 // chats prefill only the delta.
 
+type FnDef struct {
+	name string
+	description string
+	arguments string
+}
+
+type MsgTC struct {
+	id string
+	function FnDef
+}
+
 type ChatMsg struct {
 	role string
 	content string
+	tool_call_id string
+	tool_calls []MsgTC
+}
+
+type ToolDef struct {
+	function FnDef
 }
 
 type ChatReq struct {
@@ -19,6 +36,8 @@ type ChatReq struct {
 	max_tokens int
 	seed int
 	messages []ChatMsg
+	tools []ToolDef
+	reqbody string
 }
 
 var model_id = "tinyllama-1.1b-q80"
@@ -90,6 +109,137 @@ func chat_tokens(msgs) (toks) {
 	return
 }
 
+// strip surrounding double-quotes from a json_get scalar token
+func unq(s) (o) {
+	o = s
+	if len(s) >= 2 && has_prefix(s, "\"") && has_suffix(s, "\"") { o = substr(s, 1, len(s)-1) }
+	return
+}
+
+// extract the balanced-brace JSON object that contains the first occurrence of
+// `anchor` (e.g. "\"tool_call\""); "" if not found. Skips prose/code-fence wrap.
+func extract_obj(s, anchor) (o) {
+	o = ""
+	a := index(s, anchor)
+	if a < 0 { return }
+	// back up to the enclosing '{'
+	st := a
+	while st >= 0 && charat(s, st) != "{" { st = st - 1 }
+	if st < 0 { return }
+	depth := 0
+	i := st
+	instr := 0
+	esc := 0
+	while i < len(s) {
+		c := charat(s, i)
+		if esc == 1 { esc = 0  i = i + 1  continue }
+		if c == "\\" && instr == 1 { esc = 1  i = i + 1  continue }
+		if c == "\"" { if instr == 1 { instr = 0 } else { instr = 1 } }
+		if instr == 0 {
+			if c == "{" { depth = depth + 1 }
+			if c == "}" { depth = depth - 1  if depth == 0 { o = substr(s, st, i+1)  return } }
+		}
+		i = i + 1
+	}
+	return
+}
+
+// build the tool-instruction text appended to the system prompt
+func tools_prompt(tools, body) (s) {
+	s = "\n\n# Tools\nYou can call a function. Available functions:\n"
+	i := 0
+	while i < len(tools) {
+		params, _ := json_get(body, ".tools[" + str(i) + "].function.parameters")
+		if len(params) == 0 { params = "{}" }
+		s = s + "- " + tools[i].function.name + ": " + tools[i].function.description + " | parameters JSON schema: " + params + "\n"
+		i = i + 1
+	}
+	s = s + "\nWhen you need a function, reply with ONLY this exact JSON shape on one line and nothing else — no prose, no code fence:\n"
+	s = s + "{\"tool_call\": {\"name\": \"FUNCTION_NAME\", \"arguments\": {ARG_KEY: ARG_VALUE}}}\n"
+	s = s + "Example: {\"tool_call\": {\"name\": \"bash\", \"arguments\": {\"command\": \"ls -la\"}}}\n"
+	s = s + "The value of \"name\" MUST be one of the function names above, and \"arguments\" MUST be a JSON object.\n"
+	s = s + "After you receive the tool result (a message with role tool), answer the user in plain text. If no function is needed, just answer in plain text.\n"
+	return
+}
+
+// normalize messages for templating: inject tools into system prompt, render
+// prior assistant tool_calls as their JSON, and tool-result messages as user
+// observations (roles collapse to system/user/assistant for the chat template).
+func prep_messages(cr) (out) {
+	out = []ChatMsg{}
+	inject := ""
+	if len(cr.tools) > 0 { inject = tools_prompt(cr.tools, cr.reqbody) }
+	sys_done := 0
+	i := 0
+	while i < len(cr.messages) {
+		m := cr.messages[i]
+		if m.role == "system" {
+			c := m.content
+			if inject != "" && sys_done == 0 { c = c + inject  sys_done = 1 }
+			out = append(out, ChatMsg{role: "system", content: c})
+			i = i + 1
+			continue
+		}
+		if m.role == "tool" {
+			out = append(out, ChatMsg{role: "user", content: "Tool result: " + m.content})
+			i = i + 1
+			continue
+		}
+		if m.role == "assistant" && len(m.tool_calls) > 0 {
+			tc := m.tool_calls[0]
+			jc := "{\"tool_call\": {\"name\": \"" + tc.function.name + "\", \"arguments\": " + tc.function.arguments + "}}"
+			out = append(out, ChatMsg{role: "assistant", content: jc})
+			i = i + 1
+			continue
+		}
+		out = append(out, ChatMsg{role: m.role, content: m.content})
+		i = i + 1
+	}
+	// tools present but no system message yet -> prepend one
+	if inject != "" && sys_done == 0 {
+		pre := []ChatMsg{}
+		pre = append(pre, ChatMsg{role: "system", content: "You are a helpful assistant." + inject})
+		j := 0
+		while j < len(out) { pre = append(pre, out[j])  j = j + 1 }
+		out = pre
+	}
+	return
+}
+
+// first non-empty json_get among several candidate paths -> raw token ("" if none)
+func jget_any(obj, paths) (v) {
+	v = ""
+	i := 0
+	while i < len(paths) {
+		r, e := json_get(obj, paths[i])
+		if len(e) == 0 && len(r) > 0 && r != "null" { v = r  return }
+		i = i + 1
+	}
+	return
+}
+
+// detect+parse a tool call in the model's raw output -> (name, arguments_json).
+// name "" means no tool call. 1B models emit several near-formats; accept the
+// common ones: {"tool_call":{"name","arguments"}}, {"tool_call":"name","arguments":{}},
+// {"name","arguments"|"parameters"}, {"function":"name","arguments"}.
+func parse_tool_call(text) (name, argsjson) {
+	name = ""
+	argsjson = "{}"
+	obj := extract_obj(text, "\"tool_call\"")
+	if len(obj) == 0 { obj = extract_obj(text, "\"name\"") }
+	if len(obj) == 0 { obj = extract_obj(text, "\"function\"") }
+	if len(obj) == 0 { return }
+	nm := jget_any(obj, []string{".tool_call.name", ".tool_call", ".name", ".function", ".function.name"})
+	if len(nm) == 0 { return }
+	name = unq(nm)
+	if len(name) == 0 || contains(name, "{") || contains(name, " ") { name = ""  return }
+	a := jget_any(obj, []string{".tool_call.arguments", ".arguments", ".tool_call.parameters", ".parameters"})
+	if len(a) > 0 {
+		if has_prefix(a, "\"") { argsjson = "{}" } else { argsjson = a }
+	}
+	return
+}
+
 func json_esc(s) (o) {
 	o = replace(s, "\\", "\\\\")
 	o = replace(o, "\"", "\\\"")
@@ -117,10 +267,22 @@ func handle_models() (res) {
 func parse_chat_req(body) (cr, err) {
 	err = ""
 	cr = parse(body, ChatReq{})
+	cr.reqbody = body
 	if len(cr.messages) == 0 { err = "messages required" }
 	if cr.max_tokens <= 0 { cr.max_tokens = 256 }
 	if cr.temperature < 0.0 { cr.temperature = 0.0 }
 	if cr.top_p <= 0.0 || cr.top_p > 1.0 { cr.top_p = 0.9 }
+	return
+}
+
+// one tool_call as an OpenAI object fragment (arguments is a JSON string)
+func tc_obj(callid, name, argsjson) (s) {
+	s = "{\"id\":\"" + callid + "\",\"type\":\"function\",\"function\":{\"name\":\"" + json_esc(name) + "\",\"arguments\":\"" + json_esc(argsjson) + "\"}}"
+	return
+}
+
+func usage_json(np, n, reused) (s) {
+	s = "\"usage\":{\"prompt_tokens\":" + str(np) + ",\"completion_tokens\":" + str(n) + ",\"total_tokens\":" + str(np + n) + ",\"prompt_tokens_cached\":" + str(reused) + "}"
 	return
 }
 
@@ -133,8 +295,12 @@ func handle_chat(req) (res) {
 	}
 	id := "chatcmpl-" + to_hex(rand_bytes(8))
 	created := now()
-	toks := chat_tokens(cr.messages)
-	if cr.stream {
+	msgs := prep_messages(cr)
+	toks := chat_tokens(msgs)
+	has_tools := len(cr.tools) > 0
+
+	// live token streaming (no tools: we don't need to inspect the whole output)
+	if cr.stream && has_tools == false {
 		res = sse(func(conn) {
 			lk := <-mu_acq
 			lk = lk
@@ -149,6 +315,9 @@ func handle_chat(req) (res) {
 		})
 		return
 	}
+
+	// buffered path (non-stream, or stream+tools: we must see the full output to
+	// decide content-vs-tool_call before shaping the response)
 	lk := <-mu_acq
 	lk = lk
 	if cr.seed > 0 { rng_seed(cr.seed) } else { rng_seed(now_ms() & 2147483647) }
@@ -158,7 +327,34 @@ func handle_chat(req) (res) {
 	})
 	reused := gen_prefill_reused
 	mu_rel <- 1
-	body := "{\"id\":\"" + id + "\",\"object\":\"chat.completion\",\"created\":" + str(created) + ",\"model\":\"" + model_id + "\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"" + json_esc(join(out, "")) + "\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":" + str(len(toks)) + ",\"completion_tokens\":" + str(n) + ",\"total_tokens\":" + str(len(toks) + n) + ",\"prompt_tokens_cached\":" + str(reused) + "}}"
+	full := join(out, "")
+	tname := ""
+	targs := "{}"
+	if has_tools { tname, targs = parse_tool_call(full) }
+	callid := "call_" + to_hex(rand_bytes(6))
+	np := len(toks)
+
+	if cr.stream {
+		tcinner := "{\"index\":0,\"id\":\"" + callid + "\",\"type\":\"function\",\"function\":{\"name\":\"" + json_esc(tname) + "\",\"arguments\":\"" + json_esc(targs) + "\"}}"
+		res = sse(func(conn) {
+			write(conn, "data: " + chunk_json(id, created, "", "") + "\n\n")
+			if len(tname) > 0 {
+				write(conn, "data: {\"id\":\"" + id + "\",\"object\":\"chat.completion.chunk\",\"created\":" + str(created) + ",\"model\":\"" + model_id + "\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[" + tcinner + "]},\"finish_reason\":\"tool_calls\"}]}\n\n")
+			} else {
+				write(conn, "data: " + chunk_json(id, created, full, "") + "\n\n")
+				write(conn, "data: " + chunk_json(id, created, "", "stop") + "\n\n")
+			}
+			write(conn, "data: [DONE]\n\n")
+		})
+		return
+	}
+
+	if len(tname) > 0 {
+		body := "{\"id\":\"" + id + "\",\"object\":\"chat.completion\",\"created\":" + str(created) + ",\"model\":\"" + model_id + "\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[" + tc_obj(callid, tname, targs) + "]},\"finish_reason\":\"tool_calls\"}]," + usage_json(np, n, reused) + "}"
+		res = ok_json(body)
+		return
+	}
+	body := "{\"id\":\"" + id + "\",\"object\":\"chat.completion\",\"created\":" + str(created) + ",\"model\":\"" + model_id + "\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"" + json_esc(full) + "\"},\"finish_reason\":\"stop\"}]," + usage_json(np, n, reused) + "}"
 	res = ok_json(body)
 	return
 }

@@ -1,0 +1,17 @@
+[Unit]
+Description=colibri — pure-MFL OpenAI-compatible LLM server (Llama-3.2-1B)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/colibri
+Environment=COLIBRI_THREADS=10
+ExecStart=/root/colibri/serve_l3 /root/colibri/models/llama32-1b-q80.bin 8090
+Nice=15
+Restart=on-failure
+RestartSec=5
+# generation is memory-bandwidth bound; cap RAM so it can't starve the box
+MemoryMax=3G
+
+[Install]
+WantedBy=multi-user.target

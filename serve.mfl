@@ -346,9 +346,15 @@ func piece_text(prev,token)(s){if tok_l3==1{s="" if token<128000{s=vocab_l3[toke
 
 func is_stop_token(t)(r){r=false if tok_l3==1{if t==128009||t==128001||t==128008{r=true}return}if t==1||t==2{r=true}return}
 
-type ChatMsg struct{role string content string}
+type FnDef struct{name string description string arguments string}
 
-type ChatReq struct{model string stream bool temperature float top_p float max_tokens int seed int messages[]ChatMsg}
+type MsgTC struct{id string function FnDef}
+
+type ChatMsg struct{role string content string tool_call_id string tool_calls[]MsgTC}
+
+type ToolDef struct{function FnDef}
+
+type ChatReq struct{model string stream bool temperature float top_p float max_tokens int seed int messages[]ChatMsg tools[]ToolDef reqbody string}
 
 var model_id="tinyllama-1.1b-q80"
 
@@ -362,15 +368,31 @@ func l3_chat_tokens(msgs)(toks){toks=[]int{}toks=append(toks,128000)i:=0 while i
 
 func chat_tokens(msgs)(toks){if tok_l3==1{toks=l3_chat_tokens(msgs)return}toks=[]int{}toks=append(toks,1)i:=0 while i<len(msgs){m:=msgs[i]seg:=bpe_encode_raw("<|"+m.role+"|>\n"+m.content)j:=0 while j<len(seg){toks=append(toks,seg[j])j=j+1}toks=append(toks,2)nl:=bpe_encode_raw("\n")j=0 while j<len(nl){toks=append(toks,nl[j])j=j+1}i=i+1}tail:=bpe_encode_raw("<|assistant|>\n")i=0 while i<len(tail){toks=append(toks,tail[i])i=i+1}return}
 
+func unq(s)(o){o=s if len(s)>=2&&has_prefix(s,"\"")&&has_suffix(s,"\""){o=substr(s,1,len(s)-1)}return}
+
+func extract_obj(s,anchor)(o){o="" a:=index(s,anchor)if a<0{return}st:=a while st>=0&&charat(s,st)!="{"{st=st-1}if st<0{return}depth:=0 i:=st instr:=0 esc:=0 while i<len(s){c:=charat(s,i)if esc==1{esc=0  i=i+1  continue}if c=="\\"&&instr==1{esc=1  i=i+1  continue}if c=="\""{if instr==1{instr=0}else{instr=1}}if instr==0{if c=="{"{depth=depth+1}if c=="}"{depth=depth-1  if depth==0{o=substr(s,st,i+1)return}}}i=i+1}return}
+
+func tools_prompt(tools,body)(s){s="\n\n# Tools\nYou can call a function. Available functions:\n" i:=0 while i<len(tools){params,_:=json_get(body,".tools["+str(i)+"].function.parameters")if len(params)==0{params="{}"}s=s+"- "+tools[i].function.name+": "+tools[i].function.description+" | parameters JSON schema: "+params+"\n" i=i+1}s=s+"\nWhen you need a function, reply with ONLY this exact JSON shape on one line and nothing else — no prose, no code fence:\n" s=s+"{\"tool_call\": {\"name\": \"FUNCTION_NAME\", \"arguments\": {ARG_KEY: ARG_VALUE}}}\n" s=s+"Example: {\"tool_call\": {\"name\": \"bash\", \"arguments\": {\"command\": \"ls -la\"}}}\n" s=s+"The value of \"name\" MUST be one of the function names above, and \"arguments\" MUST be a JSON object.\n" s=s+"After you receive the tool result (a message with role tool), answer the user in plain text. If no function is needed, just answer in plain text.\n" return}
+
+func prep_messages(cr)(out){out=[]ChatMsg{}inject:="" if len(cr.tools)>0{inject=tools_prompt(cr.tools,cr.reqbody)}sys_done:=0 i:=0 while i<len(cr.messages){m:=cr.messages[i]if m.role=="system"{c:=m.content if inject!=""&&sys_done==0{c=c+inject  sys_done=1}out=append(out,ChatMsg{role:"system",content:c})i=i+1 continue}if m.role=="tool"{out=append(out,ChatMsg{role:"user",content:"Tool result: "+m.content})i=i+1 continue}if m.role=="assistant"&&len(m.tool_calls)>0{tc:=m.tool_calls[0]jc:="{\"tool_call\": {\"name\": \""+tc.function.name+"\", \"arguments\": "+tc.function.arguments+"}}" out=append(out,ChatMsg{role:"assistant",content:jc})i=i+1 continue}out=append(out,ChatMsg{role:m.role,content:m.content})i=i+1}if inject!=""&&sys_done==0{pre:=[]ChatMsg{}pre=append(pre,ChatMsg{role:"system",content:"You are a helpful assistant."+inject})j:=0 while j<len(out){pre=append(pre,out[j])j=j+1}out=pre}return}
+
+func jget_any(obj,paths)(v){v="" i:=0 while i<len(paths){r,e:=json_get(obj,paths[i])if len(e)==0&&len(r)>0&&r!="null"{v=r  return}i=i+1}return}
+
+func parse_tool_call(text)(name,argsjson){name="" argsjson="{}" obj:=extract_obj(text,"\"tool_call\"")if len(obj)==0{obj=extract_obj(text,"\"name\"")}if len(obj)==0{obj=extract_obj(text,"\"function\"")}if len(obj)==0{return}nm:=jget_any(obj,[]string{".tool_call.name",".tool_call",".name",".function",".function.name"})if len(nm)==0{return}name=unq(nm)if len(name)==0||contains(name,"{")||contains(name," "){name=""  return}a:=jget_any(obj,[]string{".tool_call.arguments",".arguments",".tool_call.parameters",".parameters"})if len(a)>0{if has_prefix(a,"\""){argsjson="{}"}else{argsjson=a}}return}
+
 func json_esc(s)(o){o=replace(s,"\\","\\\\")o=replace(o,"\"","\\\"")o=replace(o,"\n","\\n")o=replace(o,"\r","\\r")o=replace(o,"\t","\\t")return}
 
 func chunk_json(id,created,piece,finish)(s){d:="{\"content\":\""+json_esc(piece)+"\"}" if len(piece)==0{d="{}"}fr:="null" if len(finish)>0{fr="\""+finish+"\""}s="{\"id\":\""+id+"\",\"object\":\"chat.completion.chunk\",\"created\":"+str(created)+",\"model\":\""+model_id+"\",\"choices\":[{\"index\":0,\"delta\":"+d+",\"finish_reason\":"+fr+"}]}" return}
 
 func handle_models()(res){body:="{\"object\":\"list\",\"data\":[{\"id\":\""+model_id+"\",\"object\":\"model\",\"created\":0,\"owned_by\":\"machin-colibri\"}]}" res=ok_json(body)return}
 
-func parse_chat_req(body)(cr,err){err="" cr=parse(body,ChatReq{})if len(cr.messages)==0{err="messages required"}if cr.max_tokens<=0{cr.max_tokens=256}if cr.temperature<0.0{cr.temperature=0.0}if cr.top_p<=0.0||cr.top_p>1.0{cr.top_p=0.9}return}
+func parse_chat_req(body)(cr,err){err="" cr=parse(body,ChatReq{})cr.reqbody=body if len(cr.messages)==0{err="messages required"}if cr.max_tokens<=0{cr.max_tokens=256}if cr.temperature<0.0{cr.temperature=0.0}if cr.top_p<=0.0||cr.top_p>1.0{cr.top_p=0.9}return}
 
-func handle_chat(req)(res){cr,perr:=parse_chat_req(req.body)if len(perr)>0{res=ok_json("{\"error\":{\"message\":\""+json_esc(perr)+"\",\"type\":\"invalid_request_error\"}}")res.status="400 Bad Request" return}id:="chatcmpl-"+to_hex(rand_bytes(8))created:=now()toks:=chat_tokens(cr.messages)if cr.stream{res=sse(func(conn){lk:=<-mu_acq lk=lk if cr.seed>0{rng_seed(cr.seed)}else{rng_seed(now_ms()&2147483647)}write(conn,"data: "+chunk_json(id,created,"","")+"\n\n")generate_cb(toks,cr.max_tokens,cr.temperature,cr.top_p,func(piece){write(conn,"data: "+chunk_json(id,created,piece,"")+"\n\n")})write(conn,"data: "+chunk_json(id,created,"","stop")+"\n\n")write(conn,"data: [DONE]\n\n")mu_rel<-1})return}lk:=<-mu_acq lk=lk if cr.seed>0{rng_seed(cr.seed)}else{rng_seed(now_ms()&2147483647)}out:=[]string{}n:=generate_cb(toks,cr.max_tokens,cr.temperature,cr.top_p,func(piece){out=append(out,piece)})reused:=gen_prefill_reused mu_rel<-1 body:="{\"id\":\""+id+"\",\"object\":\"chat.completion\",\"created\":"+str(created)+",\"model\":\""+model_id+"\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\""+json_esc(join(out,""))+"\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":"+str(len(toks))+",\"completion_tokens\":"+str(n)+",\"total_tokens\":"+str(len(toks)+n)+",\"prompt_tokens_cached\":"+str(reused)+"}}" res=ok_json(body)return}
+func tc_obj(callid,name,argsjson)(s){s="{\"id\":\""+callid+"\",\"type\":\"function\",\"function\":{\"name\":\""+json_esc(name)+"\",\"arguments\":\""+json_esc(argsjson)+"\"}}" return}
+
+func usage_json(np,n,reused)(s){s="\"usage\":{\"prompt_tokens\":"+str(np)+",\"completion_tokens\":"+str(n)+",\"total_tokens\":"+str(np+n)+",\"prompt_tokens_cached\":"+str(reused)+"}" return}
+
+func handle_chat(req)(res){cr,perr:=parse_chat_req(req.body)if len(perr)>0{res=ok_json("{\"error\":{\"message\":\""+json_esc(perr)+"\",\"type\":\"invalid_request_error\"}}")res.status="400 Bad Request" return}id:="chatcmpl-"+to_hex(rand_bytes(8))created:=now()msgs:=prep_messages(cr)toks:=chat_tokens(msgs)has_tools:=len(cr.tools)>0 if cr.stream&&has_tools==false{res=sse(func(conn){lk:=<-mu_acq lk=lk if cr.seed>0{rng_seed(cr.seed)}else{rng_seed(now_ms()&2147483647)}write(conn,"data: "+chunk_json(id,created,"","")+"\n\n")generate_cb(toks,cr.max_tokens,cr.temperature,cr.top_p,func(piece){write(conn,"data: "+chunk_json(id,created,piece,"")+"\n\n")})write(conn,"data: "+chunk_json(id,created,"","stop")+"\n\n")write(conn,"data: [DONE]\n\n")mu_rel<-1})return}lk:=<-mu_acq lk=lk if cr.seed>0{rng_seed(cr.seed)}else{rng_seed(now_ms()&2147483647)}out:=[]string{}n:=generate_cb(toks,cr.max_tokens,cr.temperature,cr.top_p,func(piece){out=append(out,piece)})reused:=gen_prefill_reused mu_rel<-1 full:=join(out,"")tname:="" targs:="{}" if has_tools{tname,targs=parse_tool_call(full)}callid:="call_"+to_hex(rand_bytes(6))np:=len(toks)if cr.stream{tcinner:="{\"index\":0,\"id\":\""+callid+"\",\"type\":\"function\",\"function\":{\"name\":\""+json_esc(tname)+"\",\"arguments\":\""+json_esc(targs)+"\"}}" res=sse(func(conn){write(conn,"data: "+chunk_json(id,created,"","")+"\n\n")if len(tname)>0{write(conn,"data: {\"id\":\""+id+"\",\"object\":\"chat.completion.chunk\",\"created\":"+str(created)+",\"model\":\""+model_id+"\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":["+tcinner+"]},\"finish_reason\":\"tool_calls\"}]}\n\n")}else{write(conn,"data: "+chunk_json(id,created,full,"")+"\n\n")write(conn,"data: "+chunk_json(id,created,"","stop")+"\n\n")}write(conn,"data: [DONE]\n\n")})return}if len(tname)>0{body:="{\"id\":\""+id+"\",\"object\":\"chat.completion\",\"created\":"+str(created)+",\"model\":\""+model_id+"\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":null,\"tool_calls\":["+tc_obj(callid,tname,targs)+"]},\"finish_reason\":\"tool_calls\"}],"+usage_json(np,n,reused)+"}" res=ok_json(body)return}body:="{\"id\":\""+id+"\",\"object\":\"chat.completion\",\"created\":"+str(created)+",\"model\":\""+model_id+"\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\""+json_esc(full)+"\"},\"finish_reason\":\"stop\"}],"+usage_json(np,n,reused)+"}" res=ok_json(body)return}
 
 func api_route(req)(res){if req.method=="GET"&&req.path=="/v1/models"{res=handle_models()return}if req.method=="POST"&&req.path=="/v1/chat/completions"{res=handle_chat(req)return}if req.method=="GET"&&req.path=="/health"{res=ok_json("{\"ok\":true,\"model\":\""+model_id+"\"}")return}res=ok_json("{\"error\":{\"message\":\"not found\",\"type\":\"invalid_request_error\"}}")res.status="404 Not Found" return}
 
