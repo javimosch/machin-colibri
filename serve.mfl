@@ -1,0 +1,328 @@
+type Request struct{method     string path       string body       string body_bytes bytes headers    map[string]string remote     string}
+
+type Response struct{status  string ctype   string body    string bin     bytes is_bin  int cookies[]string location string extra[]string is_stream int is_hijack int stream  func}
+
+func hijack(fn)(r){r=Response{status:"101 Switching Protocols",ctype:"",is_hijack:1,stream:fn}}
+
+func with_header(res,name,value)(r){r=res r.extra=append(r.extra,name+": "+value)}
+
+func redirect(url)(r){r=Response{status:"302 Found",ctype:"text/html; charset=utf-8",body:"",is_bin:0,location:url}}
+
+func response(status,ctype,body)(r){r=Response{status:status,ctype:ctype,body:body,is_bin:0}}
+
+func ok_text(body)(r){r=response("200 OK","text/plain; charset=utf-8",body)}
+
+func ok_html(body)(r){r=response("200 OK","text/html; charset=utf-8",body)}
+
+func ok_json(body)(r){r=response("200 OK","application/json",body)}
+
+func created(body)(r){r=response("201 Created","application/json",body)}
+
+func bad_request(msg)(r){r=response("400 Bad Request","text/plain",msg)}
+
+func not_found()(r){r=response("404 Not Found","text/plain","not found")}
+
+func ok_bytes(ctype,b)(r){r=Response{status:"200 OK",ctype:ctype,body:"",bin:b,is_bin:1}}
+
+func ok_wasm(b)(r){r=ok_bytes("application/wasm",b)}
+
+func stream_response(status,ctype,fn)(r){r=Response{status:status,ctype:ctype,body:"",is_bin:0,is_stream:1,stream:fn}}
+
+func sse(fn)(r){r=stream_response("200 OK","text/event-stream; charset=utf-8",fn)}
+
+func sse_data(conn,data)(n){msg:="" for _,line:=range split(data,"\n"){msg=msg+"data: "+line+"\n"}n=write(conn,msg+"\n")}
+
+func sse_event(conn,event,data)(n){msg:="event: "+event+"\n" for _,line:=range split(data,"\n"){msg=msg+"data: "+line+"\n"}n=write(conn,msg+"\n")}
+
+func sse_comment(conn,c)(n){n=write(conn,": "+c+"\n\n")}
+
+func parse_headers(raw)(h){h=make(map[string]string)start:=index(raw,"\r\n")if start<0{return}sep:=index(raw,"\r\n\r\n")if sep<0{sep=len(raw)}block:=substr(raw,start+2,sep)for _,line:=range split(block,"\r\n"){ci:=index(line,":")if ci>0{h[to_lower(trim(substr(line,0,ci)))]=trim(substr(line,ci+1,len(line)))}}}
+
+func parse_request(raw)(req){nl:=index(raw,"\r\n")line:=substr(raw,0,nl)parts:=split(line," ")m:="" p:="/" if len(parts)>=2{m=parts[0]p=parts[1]}b:=http_body(raw)req=Request{method:m,path:p,body:b,body_bytes:bytes(b),headers:parse_headers(raw)}}
+
+func header(req,name)(v){v="" k:=to_lower(name)if has(req.headers,k){v=req.headers[k]}}
+
+func param(path,prefix)(v){if has_prefix(path,prefix){v=substr(path,len(prefix),len(path))}}
+
+func query(req,name)(v){v="" qi:=index(req.path,"?")if qi<0{return}for _,part:=range split(substr(req.path,qi+1,len(req.path)),"&"){eq:=index(part,"=")if eq>0{if substr(part,0,eq)==name{v=url_decode(substr(part,eq+1,len(part)))}}}}
+
+type MultipartPart struct{name     string filename string ctype    string data     bytes}
+
+func multipart_boundary(ctype)(b){b="" i:=index(to_lower(ctype),"boundary=")if i<0{return}b=substr(ctype,i+9,len(ctype))if charat(b,0)=="\""{e:=index(substr(b,1,len(b)),"\"")if e>=0{b=substr(b,1,1+e)}}else{sc:=index(b,";")if sc>=0{b=substr(b,0,sc)}}b=trim(b)}
+
+func mp_attr(head,key)(v){v="" needle:=key+"=\"" i:=index(head,needle)if i<0{return}rest:=substr(head,i+len(needle),len(head))e:=index(rest,"\"")if e>=0{v=substr(rest,0,e)}}
+
+func mp_ctype(head)(v){v="" i:=index(to_lower(head),"content-type:")if i<0{return}rest:=substr(head,i+13,len(head))nl:=index(rest,"\r\n")if nl>=0{rest=substr(rest,0,nl)}v=trim(rest)}
+
+func parse_multipart(req)(parts){parts=[]MultipartPart{}bnd:=multipart_boundary(header(req,"content-type"))if bnd==""{return}body:=req.body_bytes delim:=bytes("--"+bnd)pos:=bytes_index(body,delim,0)if pos<0{return}pos=pos+len(delim)for{if pos+2>len(body){return}if byte_at(body,pos)==45{return}hstart:=pos+2 hsep:=bytes_index(body,bytes("\r\n\r\n"),hstart)if hsep<0{return}headstr:=bytes_str(bytes_sub(body,hstart,hsep))dstart:=hsep+4 next:=bytes_index(body,delim,dstart)if next<0{return}dend:=next if dend-2>=dstart{if byte_at(body,dend-2)==13{dend=dend-2}}p:=MultipartPart{name:mp_attr(headstr,"name"),filename:mp_attr(headstr,"filename"),ctype:mp_ctype(headstr),data:bytes_sub(body,dstart,dend)}parts=append(parts,p)pos=next+len(delim)}}
+
+func multipart_file(req,name)(part,ok){ok=0 for _,p:=range parse_multipart(req){if p.filename!=""{if name==""||p.name==name{part=p  ok=1  return}}}}
+
+func multipart_field(req,name)(v){v="" for _,p:=range parse_multipart(req){if p.filename==""{if p.name==name{v=bytes_str(p.data)return}}}}
+
+func cookie(req,name)(v){v="" for _,part:=range split(header(req,"cookie"),";"){kv:=trim(part)eq:=index(kv,"=")if eq>0{if substr(kv,0,eq)==name{v=substr(kv,eq+1,len(kv))}}}}
+
+func set_cookie(res,name,value)(r){r=res sec:="" if machweb_secure_cookies==1{sec="; Secure"}r.cookies=append(r.cookies,name+"="+value+"; Path=/; HttpOnly; SameSite=Lax"+sec)}
+
+func clear_cookie(res,name)(r){r=res r.cookies=append(r.cookies,name+"=; Path=/; Max-Age=0")}
+
+func cookie_lines(res)(h){h="" for _,c:=range res.cookies{h=h+"Set-Cookie: "+c+"\r\n"}if res.location!=""{h=h+"Location: "+res.location+"\r\n"}for _,e:=range res.extra{h=h+e+"\r\n"}}
+
+func session_sign(secret,value)(s){s=value+"."+hmac_sha256(secret,value)}
+
+func session_verify(secret,signed)(value,ok){value="" ok=0 n:=len(signed)if n<65{return}if charat(signed,n-65)!="."{return}v:=substr(signed,0,n-65)if hmac_sha256(secret,v)==substr(signed,n-64,n){value=v ok=1}}
+
+func set_session(res,secret,name,value)(r){r=set_cookie(res,name,session_sign(secret,value))}
+
+func get_session(req,secret,name)(value,ok){value,ok=session_verify(secret,cookie(req,name))}
+
+var machweb_trust_proxy=0
+
+var machweb_secure_cookies=0
+
+var machweb_access_log=0
+
+var machweb_max_body=0
+
+var machweb_read_timeout=0
+
+func set_trust_proxy(n){machweb_trust_proxy=n}
+
+func set_secure_cookies(n){machweb_secure_cookies=n}
+
+func set_access_log(n){machweb_access_log=n}
+
+func set_max_body(n){machweb_max_body=n}
+
+func set_read_timeout(n){machweb_read_timeout=n}
+
+func harden(max_body_bytes,read_timeout_ms){machweb_trust_proxy=1 machweb_secure_cookies=1 machweb_access_log=1 machweb_max_body=max_body_bytes machweb_read_timeout=read_timeout_ms}
+
+func scheme(req)(s){s="http" if machweb_trust_proxy==1{xf:=header(req,"x-forwarded-proto")if xf!=""{ci:=index(xf,",")if ci>=0{xf=substr(xf,0,ci)}s=trim(xf)}}}
+
+func client_ip(req)(ip){ip=req.remote if machweb_trust_proxy==1{xf:=header(req,"x-forwarded-for")if xf!=""{ci:=index(xf,",")if ci>=0{xf=substr(xf,0,ci)}ip=trim(xf)}}}
+
+func base_url(req)(u){u=scheme(req)+"://"+header(req,"host")}
+
+func content_length(head)(n){n=0 i:=index(to_lower(head),"content-length:")if i>=0{rest:=substr(head,i+15,len(head))nl:=index(rest,"\r\n")if nl>=0{rest=substr(rest,0,nl)}n=parse_int(trim(rest))}}
+
+func read_request(conn)(raw){raw=read(conn)sep:=index(raw,"\r\n\r\n")if sep>=0{clen:=content_length(substr(raw,0,sep))body_start:=sep+4 for len(raw)-body_start<clen{chunk:=read(conn)if chunk==""{break}raw=raw+chunk}}}
+
+func read_request_bytes(conn)(raw){raw=read_bytes(conn)sep:=bytes_index(raw,bytes("\r\n\r\n"),0)if sep>=0{clen:=content_length(bytes_str(bytes_sub(raw,0,sep)))if machweb_max_body==0||clen<=machweb_max_body{body_start:=sep+4 for len(raw)-body_start<clen{chunk:=read_bytes(conn)if len(chunk)==0{break}raw=bytes_concat(raw,chunk)}}}}
+
+func parse_request_bytes(raw)(req){sep:=bytes_index(raw,bytes("\r\n\r\n"),0)head:=raw bodyb:=bytes("")if sep>=0{head=bytes_sub(raw,0,sep)bodyb=bytes_sub(raw,sep+4,len(raw))}hs:=bytes_str(head)nl:=index(hs,"\r\n")if nl<0{nl=len(hs)}line:=substr(hs,0,nl)parts:=split(line," ")m:="" p:="/" if len(parts)>=2{m=parts[0]p=parts[1]}req=Request{method:m,path:p,body:bytes_str(bodyb),body_bytes:bodyb,headers:parse_headers(hs)}}
+
+func access_log(req,status,bytes_out,ms){line:="{\"ip\":\""+client_ip(req)+"\",\"method\":\""+req.method+"\",\"path\":\""+req.path+"\",\"status\":\""+status+"\",\"bytes\":"+str(bytes_out)+",\"ms\":"+str(ms)+"}\n" w:=write(2,line)}
+
+func machweb_handle(conn,handler){started:=now_ms()if machweb_read_timeout>0{t:=socket_timeout(conn,machweb_read_timeout)}raw:=read_request_bytes(conn)req:=parse_request_bytes(raw)req.remote=peer_addr(conn)if machweb_max_body>0&&parse_int(header(req,"content-length"))>machweb_max_body{body:="request body exceeds the limit" out:="HTTP/1.1 413 Payload Too Large\r\nContent-Type: text/plain\r\nContent-Length: "+str(len(body))+"\r\nConnection: close\r\n\r\n"+body write(conn,out)close(conn)if machweb_access_log==1{access_log(req,"413 Payload Too Large",len(body),now_ms()-started)}return}res:=handler(req)if res.is_hijack==1{res.stream(conn)close(conn)return}if res.is_stream==1{shead:="HTTP/1.1 "+res.status+"\r\nContent-Type: "+res.ctype+"\r\nCache-Control: no-cache\r\nX-Accel-Buffering: no\r\n"+cookie_lines(res)+"Connection: close\r\n\r\n" write(conn,shead)if machweb_access_log==1{access_log(req,res.status+" (stream)",0,now_ms()-started)}res.stream(conn)close(conn)return}nbytes:=0 if res.is_bin==1{head:="HTTP/1.1 "+res.status+"\r\nContent-Type: "+res.ctype+"\r\nContent-Length: "+str(len(res.bin))+"\r\n"+cookie_lines(res)+"Connection: close\r\n\r\n" write(conn,head)write_bytes(conn,res.bin)nbytes=len(res.bin)}else{out:="HTTP/1.1 "+res.status+"\r\nContent-Type: "+res.ctype+"\r\nContent-Length: "+str(len(res.body))+"\r\n"+cookie_lines(res)+"Connection: close\r\n\r\n"+res.body write(conn,out)nbytes=len(res.body)}close(conn)if machweb_access_log==1{access_log(req,res.status,nbytes,now_ms()-started)}}
+
+func serve(port,handler){server:=listen(port)println("machweb on http://localhost:"+str(port))flush()for{conn:=accept(server)go machweb_handle(conn,handler)}}
+
+func read_request_bytes_tls(tls)(raw){raw=tls_read_bytes(tls)sep:=bytes_index(raw,bytes("\r\n\r\n"),0)if sep>=0{clen:=content_length(bytes_str(bytes_sub(raw,0,sep)))if machweb_max_body==0||clen<=machweb_max_body{body_start:=sep+4 for len(raw)-body_start<clen{chunk:=tls_read_bytes(tls)if len(chunk)==0{break}raw=bytes_concat(raw,chunk)}}}}
+
+func machweb_handle_tls(fd,tls,handler){started:=now_ms()if machweb_read_timeout>0{t:=socket_timeout(fd,machweb_read_timeout)}raw:=read_request_bytes_tls(tls)req:=parse_request_bytes(raw)req.remote=peer_addr(fd)if machweb_max_body>0&&parse_int(header(req,"content-length"))>machweb_max_body{body:="request body exceeds the limit" out:="HTTP/1.1 413 Payload Too Large\r\nContent-Type: text/plain\r\nContent-Length: "+str(len(body))+"\r\nConnection: close\r\n\r\n"+body tls_write(tls,out)tls_close(tls)if machweb_access_log==1{access_log(req,"413 Payload Too Large",len(body),now_ms()-started)}return}res:=handler(req)if res.is_hijack==1||res.is_stream==1{body:="hijack/stream responses are not yet supported over serve_tls" out:="HTTP/1.1 501 Not Implemented\r\nContent-Type: text/plain\r\nContent-Length: "+str(len(body))+"\r\nConnection: close\r\n\r\n"+body tls_write(tls,out)tls_close(tls)if machweb_access_log==1{access_log(req,"501 Not Implemented (hijack/stream)",len(body),now_ms()-started)}return}nbytes:=0 if res.is_bin==1{head:="HTTP/1.1 "+res.status+"\r\nContent-Type: "+res.ctype+"\r\nContent-Length: "+str(len(res.bin))+"\r\n"+cookie_lines(res)+"Connection: close\r\n\r\n" tls_write(tls,head)tls_write_bytes(tls,res.bin)nbytes=len(res.bin)}else{out:="HTTP/1.1 "+res.status+"\r\nContent-Type: "+res.ctype+"\r\nContent-Length: "+str(len(res.body))+"\r\n"+cookie_lines(res)+"Connection: close\r\n\r\n"+res.body tls_write(tls,out)nbytes=len(res.body)}tls_close(tls)if machweb_access_log==1{access_log(req,res.status,nbytes,now_ms()-started)}}
+
+func machweb_accept_tls(ctx,fd,handler){tls:=tls_accept(ctx,fd)if tls==0{close(fd)return}machweb_handle_tls(fd,tls,handler)}
+
+func serve_tls(port,certfile,keyfile,handler){ctx:=tls_server_ctx(certfile,keyfile)if ctx==0{println("serve_tls: failed to load "+certfile+" / "+keyfile)return}server:=listen(port)println("machweb on https://localhost:"+str(port))flush()for{fd:=accept(server)go machweb_accept_tls(ctx,fd,handler)}}
+
+func new_router()(r){r=make(map[string]func)}
+
+func route(router,method,path,handler){router[method+" "+path]=handler}
+
+func dispatch(router,req)(res){key:=req.method+" "+req.path if has(router,key){h:=router[key]res=h(req)}else{res=not_found()}}
+
+func serve_router(port,router){serve(port,func(req){return dispatch(router,req)})}
+
+var dim=0
+
+var hidden_dim=0
+
+var n_layers=0
+
+var n_heads=0
+
+var n_kv_heads=0
+
+var vocab_size=0
+
+var seq_len=0
+
+var head_size=0
+
+var kv_dim=0
+
+var gs=0
+
+var shared_cls=0
+
+var quant4=0
+
+var wbuf=0
+
+var w_rms_att=0
+
+var w_rms_ffn=0
+
+var w_rms_final=0
+
+var w_tok=0
+
+var wq_b=0
+
+var wk_b=0
+
+var wv_b=0
+
+var wo_b=0
+
+var w1_b=0
+
+var w2_b=0
+
+var w3_b=0
+
+var wcls_b=0
+
+var s_x=0
+
+var s_xb=0
+
+var s_xb2=0
+
+var s_hb=0
+
+var s_hb2=0
+
+var s_q=0
+
+var s_att=0
+
+var s_logits=0
+
+var s_key_cache=0
+
+var s_val_cache=0
+
+var s_xq=0
+
+var s_xq_s=0
+
+var s_hq=0
+
+var s_hq_s=0
+
+var vocab=[]string{}
+
+var vocab_idx=make(map[string]int)
+
+var tok_scores=0
+
+func read_i32(b,off)(v){v=byte_at(b,off)|byte_at(b,off+1)<<8|byte_at(b,off+2)<<16|byte_at(b,off+3)<<24 if v>=2147483648{v=v-4294967296}return}
+
+func bytes_to_buf(b)(p){n:=len(b)p=alloc(n+4)i:=0 while i+4<=n{w:=byte_at(b,i)|byte_at(b,i+1)<<8|byte_at(b,i+2)<<16|byte_at(b,i+3)<<24 poke_i32(p,i,w)i=i+4}while i<n{poke_u8(p,i,byte_at(b,i))i=i+1}return}
+
+func wsz(size)(n){n=size  if quant4==1{n=size/2}return}
+
+func qblock(size)(n){n=wsz(size)+4*(size/gs)return}
+
+func load_model(path){b:=read_file_bytes(path)if len(b)==0{println("cannot read model: "+path)exit(1)}m:=read_i32(b,0)if m==1634415666{quant4=0}else{if m==1634415667{quant4=1}else{println("bad magic (want ak42 v2 int8 or ak43 v3 int4)")exit(1)}}dim=read_i32(b,8)hidden_dim=read_i32(b,12)n_layers=read_i32(b,16)n_heads=read_i32(b,20)n_kv_heads=read_i32(b,24)vocab_size=read_i32(b,28)seq_len=read_i32(b,32)shared_cls=byte_at(b,36)gs=read_i32(b,37)head_size=dim/n_heads kv_dim=(dim*n_kv_heads)/n_heads wbuf=bytes_to_buf(b)o:=256 w_rms_att=o    o=o+n_layers*dim*4 w_rms_ffn=o    o=o+n_layers*dim*4 w_rms_final=o  o=o+dim*4 w_tok=o        o=o+qblock(vocab_size*dim)wq_b=o         o=o+n_layers*qblock(dim*dim)wk_b=o         o=o+n_layers*qblock(dim*kv_dim)wv_b=o         o=o+n_layers*qblock(dim*kv_dim)wo_b=o         o=o+n_layers*qblock(dim*dim)w1_b=o         o=o+n_layers*qblock(dim*hidden_dim)w2_b=o         o=o+n_layers*qblock(hidden_dim*dim)w3_b=o         o=o+n_layers*qblock(dim*hidden_dim)if shared_cls==1{wcls_b=w_tok}else{wcls_b=o}}
+
+func alloc_state(){s_x=alloc(dim*4)s_xb=alloc(dim*4)s_xb2=alloc(dim*4)s_hb=alloc(hidden_dim*4)s_hb2=alloc(hidden_dim*4)s_q=alloc(dim*4)s_att=alloc(n_heads*seq_len*4)s_logits=alloc(vocab_size*4)s_key_cache=alloc(n_layers*seq_len*kv_dim*4)s_val_cache=alloc(n_layers*seq_len*kv_dim*4)s_xq=alloc(dim)s_xq_s=alloc((dim/gs)*4)s_hq=alloc(hidden_dim)s_hq_s=alloc((hidden_dim/gs)*4)}
+
+func load_tokenizer(path){b:=read_file_bytes(path)if len(b)==0{println("cannot read tokenizer: "+path)exit(1)}tbuf:=bytes_to_buf(b)tok_scores=alloc(vocab_size*4)off:=4 i:=0 while i<vocab_size{poke_f32(tok_scores,i*4,peek_f32(tbuf,off))off=off+4 n:=read_i32(b,off)off=off+4 piece:=bytes_str(bytes_sub(b,off,off+n))vocab=append(vocab,piece)vocab_idx[piece]=i off=off+n i=i+1}free(tbuf)}
+
+func rmsnorm(dst,x,w,size){ss:=0.0 j:=0 while j<size{v:=peek_f32(x,j*4)ss=ss+v*v j=j+1}ss=ss/float(size)ss=1.0/sqrt(ss+0.00001)j=0 while j<size{poke_f32(dst,j*4,peek_f32(w,j*4)*ss*peek_f32(x,j*4))j=j+1}}
+
+func softmax(x,size){mx:=peek_f32(x,0)i:=1 while i<size{v:=peek_f32(x,i*4)if v>mx{mx=v}i=i+1}sum:=0.0 i=0 while i<size{e:=exp(peek_f32(x,i*4)-mx)poke_f32(x,i*4,e)sum=sum+e i=i+1}i=0 while i<size{poke_f32(x,i*4,peek_f32(x,i*4)/sum)i=i+1}}
+
+func quantize_act(xq,xs,x,n){ng:=n/gs g:=0 while g<ng{base:=g*gs wmax:=0.0 i:=0 while i<gs{v:=abs(peek_f32(x,(base+i)*4))if v>wmax{wmax=v}i=i+1}scale:=wmax/127.0 poke_f32(xs,g*4,scale)i=0 while i<gs{q:=0 if scale>0.0{q=int(round(peek_f32(x,(base+i)*4)/scale))}poke_u8(xq,base+i,q&255)i=i+1}g=g+1}}
+
+func matmul_q(xout,xq,xs,wq,ws,n,lo,hi){i:=lo while i<hi{val:=0.0 in:=i*n wrow:=wbuf+wq+in j:=0 while j<n{ival:=dot_i8(xq+j,wrow+j,gs)val=val+float(ival)*peek_f32(wbuf,ws+((in+j)/gs)*4)*peek_f32(xs,(j/gs)*4)j=j+gs}poke_f32(xout,i*4,val)i=i+1}}
+
+func matmul_q4(xout,xq,xs,wq,ws,n,lo,hi,sc){h:=gs/2 i:=lo while i<hi{wrow:=wbuf+wq+i*(n/2)g:=0 while g<n/gs{wg:=wrow+g*h sg:=sc+g*gs k:=0 while k<h{b:=peek_u8(wg,k)poke_u8(sg,k,((b&15)-8)&255)poke_u8(sg,k+h,((b>>4)-8)&255)k=k+1}g=g+1}val:=0.0 in:=i*n j:=0 while j<n{ival:=dot_i8(xq+j,sc+j,gs)val=val+float(ival)*peek_f32(wbuf,ws+((in+j)/gs)*4)*peek_f32(xs,(j/gs)*4)j=j+gs}poke_f32(xout,i*4,val)i=i+1}}
+
+func mmj(xout,xq,xs,tb,tsize,n,lo,hi,sc){if quant4==1{matmul_q4(xout,xq,xs,tb,tb+wsz(tsize),n,lo,hi,sc)}else{matmul_q(xout,xq,xs,tb,tb+wsz(tsize),n,lo,hi)}}
+
+func embed_token(token){row:=token*dim sbase:=w_tok+wsz(vocab_size*dim)if quant4==1{h:=gs/2 g:=0 while g<dim/gs{gq:=w_tok+token*(dim/2)+g*h sc:=peek_f32(wbuf,sbase+((row+g*gs)/gs)*4)i:=0 while i<h{b:=peek_u8(wbuf,gq+i)poke_f32(s_x,(g*gs+i)*4,float((b&15)-8)*sc)poke_f32(s_x,(g*gs+i+h)*4,float((b>>4)-8)*sc)i=i+1}g=g+1}return}i:=0 while i<dim{poke_f32(s_x,i*4,float(peek_i8(wbuf,w_tok+row+i))*peek_f32(wbuf,sbase+((row+i)/gs)*4))i=i+1}}
+
+func rope(l,pos){kptr:=s_key_cache+(l*seq_len*kv_dim+pos*kv_dim)*4 i:=0 while i<dim{hd:=i%head_size freq:=1.0/pow(10000.0,float(hd)/float(head_size))val:=float(pos)*freq fcr:=cos(val)fci:=sin(val)q0:=peek_f32(s_q,i*4)q1:=peek_f32(s_q,i*4+4)poke_f32(s_q,i*4,q0*fcr-q1*fci)poke_f32(s_q,i*4+4,q0*fci+q1*fcr)if i<kv_dim{k0:=peek_f32(kptr,i*4)k1:=peek_f32(kptr,i*4+4)poke_f32(kptr,i*4,k0*fcr-k1*fci)poke_f32(kptr,i*4+4,k0*fci+k1*fcr)}i=i+2}}
+
+func attn_head(h,l,pos){loff:=l*seq_len*kv_dim kv_mul:=n_heads/n_kv_heads qh:=s_q+h*head_size*4 atth:=s_att+h*seq_len*4 t:=0 while t<=pos{kt:=s_key_cache+(loff+t*kv_dim+(h/kv_mul)*head_size)*4 score:=0.0 j:=0 while j<head_size{score=score+peek_f32(qh,j*4)*peek_f32(kt,j*4)j=j+1}poke_f32(atth,t*4,score/sqrt(float(head_size)))t=t+1}softmax(atth,pos+1)xbh:=s_xb+h*head_size*4 j:=0 while j<head_size{poke_f32(xbh,j*4,0.0)j=j+1}t=0 while t<=pos{vt:=s_val_cache+(loff+t*kv_dim+(h/kv_mul)*head_size)*4 a:=peek_f32(atth,t*4)j=0 while j<head_size{poke_f32(xbh,j*4,peek_f32(xbh,j*4)+a*peek_f32(vt,j*4))j=j+1}t=t+1}}
+
+var n_workers=1
+
+var jobs=make(chan int)
+
+var done=make(chan int)
+
+var pending=0
+
+func do_job(j,sc){t:=j&15 l:=(j>>4)&255 pos:=(j>>12)&4095 lo:=(j>>24)&1048575 hi:=j>>44 if t==0{mmj(s_q,s_xq,s_xq_s,wq_b+l*qblock(dim*dim),dim*dim,dim,lo,hi,sc)}if t==1{kptr:=s_key_cache+(l*seq_len*kv_dim+pos*kv_dim)*4 mmj(kptr,s_xq,s_xq_s,wk_b+l*qblock(dim*kv_dim),dim*kv_dim,dim,lo,hi,sc)}if t==2{vptr:=s_val_cache+(l*seq_len*kv_dim+pos*kv_dim)*4 mmj(vptr,s_xq,s_xq_s,wv_b+l*qblock(dim*kv_dim),dim*kv_dim,dim,lo,hi,sc)}if t==3{mmj(s_xb2,s_xq,s_xq_s,wo_b+l*qblock(dim*dim),dim*dim,dim,lo,hi,sc)}if t==4{mmj(s_hb,s_xq,s_xq_s,w1_b+l*qblock(dim*hidden_dim),dim*hidden_dim,dim,lo,hi,sc)}if t==5{mmj(s_hb2,s_xq,s_xq_s,w3_b+l*qblock(dim*hidden_dim),dim*hidden_dim,dim,lo,hi,sc)}if t==6{mmj(s_xb,s_hq,s_hq_s,w2_b+l*qblock(hidden_dim*dim),hidden_dim*dim,hidden_dim,lo,hi,sc)}if t==7{mmj(s_logits,s_xq,s_xq_s,wcls_b,dim*vocab_size,dim,lo,hi,sc)}if t==8{h:=lo while h<hi{attn_head(h,l,pos)h=h+1}}if t==9{mmj(s_q,s_xq,s_xq_s,wq_b+l*qblock(dim*dim),dim*dim,dim,lo,hi,sc)klo:=(lo*kv_dim)/dim khi:=(hi*kv_dim)/dim if khi>klo{kptr:=s_key_cache+(l*seq_len*kv_dim+pos*kv_dim)*4 vptr:=s_val_cache+(l*seq_len*kv_dim+pos*kv_dim)*4 mmj(kptr,s_xq,s_xq_s,wk_b+l*qblock(dim*kv_dim),dim*kv_dim,dim,klo,khi,sc)mmj(vptr,s_xq,s_xq_s,wv_b+l*qblock(dim*kv_dim),dim*kv_dim,dim,klo,khi,sc)}}if t==10{mmj(s_hb,s_xq,s_xq_s,w1_b+l*qblock(dim*hidden_dim),dim*hidden_dim,dim,lo,hi,sc)mmj(s_hb2,s_xq,s_xq_s,w3_b+l*qblock(dim*hidden_dim),dim*hidden_dim,dim,lo,hi,sc)}}
+
+func worker(jc,dc){sc:=alloc(hidden_dim)for j:=range jc{do_job(j,sc)dc<-1}}
+
+func dispatch_rows(t,l,pos,d){nc:=n_workers if nc>d{nc=d}chunk:=(d+nc-1)/nc lo:=0 while lo<d{hi:=lo+chunk if hi>d{hi=d}if pending>=n_workers{<-done  pending=pending-1}jobs<-(t|l<<4|pos<<12|lo<<24|hi<<44)pending=pending+1 lo=hi}}
+
+func barrier(){while pending>0{<-done  pending=pending-1}}
+
+func forward(token,pos){embed_token(token)i:=0 l:=0 while l<n_layers{rmsnorm(s_xb,s_x,wbuf+w_rms_att+l*dim*4,dim)quantize_act(s_xq,s_xq_s,s_xb,dim)dispatch_rows(9,l,pos,dim)barrier()rope(l,pos)dispatch_rows(8,l,pos,n_heads)barrier()quantize_act(s_xq,s_xq_s,s_xb,dim)dispatch_rows(3,l,pos,dim)barrier()i=0 while i<dim{poke_f32(s_x,i*4,peek_f32(s_x,i*4)+peek_f32(s_xb2,i*4))i=i+1}rmsnorm(s_xb,s_x,wbuf+w_rms_ffn+l*dim*4,dim)quantize_act(s_xq,s_xq_s,s_xb,dim)dispatch_rows(10,l,pos,hidden_dim)barrier()i=0 while i<hidden_dim{v:=peek_f32(s_hb,i*4)v=v*(1.0/(1.0+exp(0.0-v)))poke_f32(s_hb,i*4,v*peek_f32(s_hb2,i*4))i=i+1}quantize_act(s_hq,s_hq_s,s_hb,hidden_dim)dispatch_rows(6,l,pos,dim)barrier()i=0 while i<dim{poke_f32(s_x,i*4,peek_f32(s_x,i*4)+peek_f32(s_xb,i*4))i=i+1}l=l+1}rmsnorm(s_x,s_x,wbuf+w_rms_final,dim)quantize_act(s_xq,s_xq_s,s_x,dim)dispatch_rows(7,0,pos,vocab_size)barrier()}
+
+func argmax_logits()(best){best=0 bv:=peek_f32(s_logits,0)i:=1 while i<vocab_size{v:=peek_f32(s_logits,i*4)if v>bv{bv=v  best=i}i=i+1}return}
+
+func bpe_encode(text)(toks){toks=bpe_encode_opts(text,1,1)return}
+
+func bpe_encode_opts(text,add_bos,add_prefix)(toks){toks=[]int{}if add_bos==1{toks=append(toks,1)}if len(text)==0{return}if add_prefix==1{toks=append(toks,vocab_idx[" "])}b:=bytes(text)n:=len(b)i:=0 while i<n{j:=i+1 while j<n&&(byte_at(b,j)&192)==128{j=j+1}c:=bytes_str(bytes_sub(b,i,j))if has(vocab_idx,c){toks=append(toks,vocab_idx[c])}else{k:=i while k<j{toks=append(toks,byte_at(b,k)+3)k=k+1}}i=j}while true{best_score:=0.0-1000000000.0 best_id:=-1 best_idx:=-1 ti:=0 while ti<len(toks)-1{merged:=vocab[toks[ti]]+vocab[toks[ti+1]]if has(vocab_idx,merged){id:=vocab_idx[merged]sc:=peek_f32(tok_scores,id*4)if sc>best_score{best_score=sc  best_id=id  best_idx=ti}}ti=ti+1}if best_idx==-1{break}nt:=[]int{}ti=0 while ti<len(toks){if ti==best_idx{nt=append(nt,best_id)ti=ti+2}else{nt=append(nt,toks[ti])ti=ti+1}}toks=nt}return}
+
+func decode_piece(prev,token)(piece){piece=vocab[token]if prev==1&&has_prefix(piece," "){piece=substr(piece,1,len(piece))}if has_prefix(piece,"<0x")&&has_suffix(piece,">"){piece=bytes_str(from_hex(substr(piece,3,5)))}return}
+
+var rng_state=12345
+
+func rng_seed(s){if s<=0{s=1}rng_state=s&2147483647}
+
+func rng_f()(r){rng_state=(rng_state*1103515245+12345)&2147483647 r=float(rng_state)/2147483648.0 return}
+
+func logits_softmax(temp){i:=0 while i<vocab_size{poke_f32(s_logits,i*4,peek_f32(s_logits,i*4)/temp)i=i+1}softmax(s_logits,vocab_size)}
+
+func sample_topp(topp)(tok){cutoff:=(1.0-topp)/float(vocab_size-1)idx:=[]int{}i:=0 while i<vocab_size{if peek_f32(s_logits,i*4)>=cutoff{idx=append(idx,i)}i=i+1}n:=len(idx)lo_s:=[]int{0}hi_s:=[]int{n-1}while len(lo_s)>0{lo:=lo_s[len(lo_s)-1]hi:=hi_s[len(hi_s)-1]nl:=[]int{}nh:=[]int{}k:=0 while k<len(lo_s)-1{nl=append(nl,lo_s[k])nh=append(nh,hi_s[k])k=k+1}lo_s=nl hi_s=nh if lo<hi{pv:=peek_f32(s_logits,idx[(lo+hi)/2]*4)a:=lo b:=hi while a<=b{while peek_f32(s_logits,idx[a]*4)>pv{a=a+1}while peek_f32(s_logits,idx[b]*4)<pv{b=b-1}if a<=b{t:=idx[a]idx[a]=idx[b]idx[b]=t a=a+1 b=b-1}}if lo<b{lo_s=append(lo_s,lo)hi_s=append(hi_s,b)}if a<hi{lo_s=append(lo_s,a)hi_s=append(hi_s,hi)}}}cum:=0.0 last:=n-1 i=0 while i<n{cum=cum+peek_f32(s_logits,idx[i]*4)if cum>topp{last=i  break}i=i+1}r:=rng_f()*cum cdf:=0.0 tok=idx[last]i=0 while i<=last{cdf=cdf+peek_f32(s_logits,idx[i]*4)if r<cdf{tok=idx[i]return}i=i+1}return}
+
+func sample_next(temp,topp)(tok){if temp<=0.0{tok=argmax_logits()return}logits_softmax(temp)if topp>0.0&&topp<1.0{tok=sample_topp(topp)return}r:=rng_f()cdf:=0.0 tok=vocab_size-1 i:=0 while i<vocab_size{cdf=cdf+peek_f32(s_logits,i*4)if r<cdf{tok=i  return}i=i+1}return}
+
+var cache_toks=[]int{}
+
+func cache_common(toks)(l){l=0 n:=len(toks)if len(cache_toks)<n{n=len(cache_toks)}while l<n{if cache_toks[l]!=toks[l]{return}l=l+1}return}
+
+var gen_prefill_reused=0
+
+func generate_cb(toks,max_new,temp,topp,emit)(gen){np:=len(toks)start:=cache_common(toks)if start>=np{start=np-1}gen_prefill_reused=start i:=start while i<np{forward(toks[i],i)i=i+1}nc:=[]int{}i=0 while i<np{nc=append(nc,toks[i])i=i+1}pos:=np token:=0 gen=0 while gen<max_new&&pos<seq_len{token=sample_next(temp,topp)if token==1||token==2{break}prev:=1 if gen>0||np>0{prev=nc[len(nc)-1]}emit(decode_piece(prev,token))nc=append(nc,token)forward(token,pos)pos=pos+1 gen=gen+1}cache_toks=nc return}
+
+func bpe_encode_raw(text)(toks){toks=bpe_encode_opts(text,0,0)return}
+
+type ChatMsg struct{role string content string}
+
+type ChatReq struct{model string stream bool temperature float top_p float max_tokens int seed int messages[]ChatMsg}
+
+var model_id="tinyllama-1.1b-q80"
+
+var mu_acq=make(chan int)
+
+var mu_rel=make(chan int)
+
+func mutex_srv(acq,rel){while true{acq<-1 v:=<-rel if v<0{break}}}
+
+func chat_tokens(msgs)(toks){toks=[]int{}toks=append(toks,1)i:=0 while i<len(msgs){m:=msgs[i]seg:=bpe_encode_raw("<|"+m.role+"|>\n"+m.content)j:=0 while j<len(seg){toks=append(toks,seg[j])j=j+1}toks=append(toks,2)nl:=bpe_encode_raw("\n")j=0 while j<len(nl){toks=append(toks,nl[j])j=j+1}i=i+1}tail:=bpe_encode_raw("<|assistant|>\n")i=0 while i<len(tail){toks=append(toks,tail[i])i=i+1}return}
+
+func json_esc(s)(o){o=replace(s,"\\","\\\\")o=replace(o,"\"","\\\"")o=replace(o,"\n","\\n")o=replace(o,"\r","\\r")o=replace(o,"\t","\\t")return}
+
+func chunk_json(id,created,piece,finish)(s){d:="{\"content\":\""+json_esc(piece)+"\"}" if len(piece)==0{d="{}"}fr:="null" if len(finish)>0{fr="\""+finish+"\""}s="{\"id\":\""+id+"\",\"object\":\"chat.completion.chunk\",\"created\":"+str(created)+",\"model\":\""+model_id+"\",\"choices\":[{\"index\":0,\"delta\":"+d+",\"finish_reason\":"+fr+"}]}" return}
+
+func handle_models()(res){body:="{\"object\":\"list\",\"data\":[{\"id\":\""+model_id+"\",\"object\":\"model\",\"created\":0,\"owned_by\":\"machin-colibri\"}]}" res=ok_json(body)return}
+
+func parse_chat_req(body)(cr,err){err="" cr=parse(body,ChatReq{})if len(cr.messages)==0{err="messages required"}if cr.max_tokens<=0{cr.max_tokens=256}if cr.temperature<0.0{cr.temperature=0.0}if cr.top_p<=0.0||cr.top_p>1.0{cr.top_p=0.9}return}
+
+func handle_chat(req)(res){cr,perr:=parse_chat_req(req.body)if len(perr)>0{res=ok_json("{\"error\":{\"message\":\""+json_esc(perr)+"\",\"type\":\"invalid_request_error\"}}")res.status="400 Bad Request" return}id:="chatcmpl-"+to_hex(rand_bytes(8))created:=now()toks:=chat_tokens(cr.messages)if cr.stream{res=sse(func(conn){lk:=<-mu_acq lk=lk if cr.seed>0{rng_seed(cr.seed)}else{rng_seed(now_ms()&2147483647)}write(conn,"data: "+chunk_json(id,created,"","")+"\n\n")generate_cb(toks,cr.max_tokens,cr.temperature,cr.top_p,func(piece){write(conn,"data: "+chunk_json(id,created,piece,"")+"\n\n")})write(conn,"data: "+chunk_json(id,created,"","stop")+"\n\n")write(conn,"data: [DONE]\n\n")mu_rel<-1})return}lk:=<-mu_acq lk=lk if cr.seed>0{rng_seed(cr.seed)}else{rng_seed(now_ms()&2147483647)}out:=[]string{}n:=generate_cb(toks,cr.max_tokens,cr.temperature,cr.top_p,func(piece){out=append(out,piece)})reused:=gen_prefill_reused mu_rel<-1 body:="{\"id\":\""+id+"\",\"object\":\"chat.completion\",\"created\":"+str(created)+",\"model\":\""+model_id+"\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\""+json_esc(join(out,""))+"\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":"+str(len(toks))+",\"completion_tokens\":"+str(n)+",\"total_tokens\":"+str(len(toks)+n)+",\"prompt_tokens_cached\":"+str(reused)+"}}" res=ok_json(body)return}
+
+func api_route(req)(res){if req.method=="GET"&&req.path=="/v1/models"{res=handle_models()return}if req.method=="POST"&&req.path=="/v1/chat/completions"{res=handle_chat(req)return}if req.method=="GET"&&req.path=="/health"{res=ok_json("{\"ok\":true,\"model\":\""+model_id+"\"}")return}res=ok_json("{\"error\":{\"message\":\"not found\",\"type\":\"invalid_request_error\"}}")res.status="404 Not Found" return}
+
+func main(){a:=args()model:="models/tinyllama-1.1b-q80.bin" port:=8090 if len(a)>1{model=a[1]}if len(a)>2{port=parse_int(a[2])}nw:=parse_int(env("COLIBRI_THREADS"))if nw>0{n_workers=nw}else{n_workers=6}t0:=now_ms()load_model(model)alloc_state()load_tokenizer("models/tokenizer.bin")w:=0 while w<n_workers{go worker(jobs,done)w=w+1}go mutex_srv(mu_acq,mu_rel)println("colibri serve: model="+model_id+" dim="+str(dim)+" layers="+str(n_layers)+" workers="+str(n_workers)+" loaded in "+str(now_ms()-t0)+" ms")println("OpenAI-compatible API on http://0.0.0.0:"+str(port)+"/v1")serve(port,func(req){return api_route(req)})}
+

@@ -1,0 +1,46 @@
+// colibri_q CLI — composes with engine.src (machin encode engine.src cli.src)
+func main() {
+	a := args()
+	model := "models/tinyllama-1.1b-q80.bin"
+	steps := 64
+	prompt := ""
+	if len(a) > 1 { model = a[1] }
+	if len(a) > 2 { steps = parse_int(a[2]) }
+	if len(a) > 3 { prompt = a[3] }
+	nw := parse_int(env("COLIBRI_THREADS"))
+	if nw > 0 { n_workers = nw } else { n_workers = 8 }
+	t0 := now_ms()
+	load_model(model)
+	alloc_state()
+	load_tokenizer("models/tokenizer.bin")
+	w := 0
+	while w < n_workers { go worker(jobs, done)  w = w + 1 }
+	t1 := now_ms()
+	println("loaded: dim=" + str(dim) + " hidden=" + str(hidden_dim) + " layers=" + str(n_layers) + " heads=" + str(n_heads) + " kv_heads=" + str(n_kv_heads) + " vocab=" + str(vocab_size) + " seq=" + str(seq_len) + " gs=" + str(gs) + " shared_cls=" + str(shared_cls) + " (" + str(t1 - t0) + " ms)")
+	if steps > seq_len { steps = seq_len }
+	ptoks := bpe_encode(prompt)
+	token := ptoks[0]
+	pos := 0
+	t2 := now_ms()
+	dl := env("DL")
+	while pos < steps {
+		forward(token, pos)
+		if len(dl) > 0 {
+			am := argmax_logits()
+			println("DL " + str(pos) + " tok=" + str(token) + " argmax=" + str(am) + " v=" + str(peek_f32(s_logits, am*4)) + " l0=" + str(peek_f32(s_logits, 0)) + " l1=" + str(peek_f32(s_logits, 4)) + " l2=" + str(peek_f32(s_logits, 8)))
+		}
+		next := 0
+		if pos < len(ptoks) - 1 { next = ptoks[pos+1] } else { next = argmax_logits() }
+		pos = pos + 1
+		if next == 1 || next == 2 { break } // BOS/EOS
+		print(decode_piece(token, next))
+		flush()
+		token = next
+	}
+	t3 := now_ms()
+	println("")
+	if t3 > t2 && pos > 0 {
+		tps := float(pos) * 1000.0 / float(t3 - t2)
+		println("tokens: " + str(pos) + "  time: " + str(t3 - t2) + " ms  tok/s: " + str(tps))
+	}
+}

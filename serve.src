@@ -1,0 +1,159 @@
+// colibri serve — OpenAI-compatible inference server in pure MFL.
+// Build: machin encode framework/machweb.src engine.src serve.src > serve.mfl
+// Endpoints: GET /v1/models, POST /v1/chat/completions (stream + non-stream).
+// Single-flight: one generation at a time via a mutex-as-service channel;
+// the winning request runs inference in ITS goroutine (worker pool is shared,
+// exclusive under the lock). Single-slot KV prefix cache makes multi-turn
+// chats prefill only the delta.
+
+type ChatMsg struct {
+	role string
+	content string
+}
+
+type ChatReq struct {
+	model string
+	stream bool
+	temperature float
+	top_p float
+	max_tokens int
+	seed int
+	messages []ChatMsg
+}
+
+var model_id = "tinyllama-1.1b-q80"
+var mu_acq = make(chan int)
+var mu_rel = make(chan int)
+
+func mutex_srv(acq, rel) {
+	while true {
+		acq <- 1
+		v := <-rel
+		if v < 0 { break }
+	}
+}
+
+// Zephyr chat template at the TOKEN level: "</s>" must be the real EOS id (2),
+// not the text "</s>" run through BPE (they tokenize differently).
+func chat_tokens(msgs) (toks) {
+	toks = []int{}
+	toks = append(toks, 1) // BOS
+	i := 0
+	while i < len(msgs) {
+		m := msgs[i]
+		seg := bpe_encode_raw("<|" + m.role + "|>\n" + m.content)
+		j := 0
+		while j < len(seg) { toks = append(toks, seg[j])  j = j + 1 }
+		toks = append(toks, 2) // EOS closes each turn
+		nl := bpe_encode_raw("\n")
+		j = 0
+		while j < len(nl) { toks = append(toks, nl[j])  j = j + 1 }
+		i = i + 1
+	}
+	tail := bpe_encode_raw("<|assistant|>\n")
+	i = 0
+	while i < len(tail) { toks = append(toks, tail[i])  i = i + 1 }
+	return
+}
+
+func json_esc(s) (o) {
+	o = replace(s, "\\", "\\\\")
+	o = replace(o, "\"", "\\\"")
+	o = replace(o, "\n", "\\n")
+	o = replace(o, "\r", "\\r")
+	o = replace(o, "\t", "\\t")
+	return
+}
+
+func chunk_json(id, created, piece, finish) (s) {
+	d := "{\"content\":\"" + json_esc(piece) + "\"}"
+	if len(piece) == 0 { d = "{}" }
+	fr := "null"
+	if len(finish) > 0 { fr = "\"" + finish + "\"" }
+	s = "{\"id\":\"" + id + "\",\"object\":\"chat.completion.chunk\",\"created\":" + str(created) + ",\"model\":\"" + model_id + "\",\"choices\":[{\"index\":0,\"delta\":" + d + ",\"finish_reason\":" + fr + "}]}"
+	return
+}
+
+func handle_models() (res) {
+	body := "{\"object\":\"list\",\"data\":[{\"id\":\"" + model_id + "\",\"object\":\"model\",\"created\":0,\"owned_by\":\"machin-colibri\"}]}"
+	res = ok_json(body)
+	return
+}
+
+func parse_chat_req(body) (cr, err) {
+	err = ""
+	cr = parse(body, ChatReq{})
+	if len(cr.messages) == 0 { err = "messages required" }
+	if cr.max_tokens <= 0 { cr.max_tokens = 256 }
+	if cr.temperature < 0.0 { cr.temperature = 0.0 }
+	if cr.top_p <= 0.0 || cr.top_p > 1.0 { cr.top_p = 0.9 }
+	return
+}
+
+func handle_chat(req) (res) {
+	cr, perr := parse_chat_req(req.body)
+	if len(perr) > 0 {
+		res = ok_json("{\"error\":{\"message\":\"" + json_esc(perr) + "\",\"type\":\"invalid_request_error\"}}")
+		res.status = "400 Bad Request"
+		return
+	}
+	id := "chatcmpl-" + to_hex(rand_bytes(8))
+	created := now()
+	toks := chat_tokens(cr.messages)
+	if cr.stream {
+		res = sse(func(conn) {
+			lk := <-mu_acq
+			lk = lk
+			if cr.seed > 0 { rng_seed(cr.seed) } else { rng_seed(now_ms() & 2147483647) }
+			write(conn, "data: " + chunk_json(id, created, "", "") + "\n\n")
+			generate_cb(toks, cr.max_tokens, cr.temperature, cr.top_p, func(piece) {
+				write(conn, "data: " + chunk_json(id, created, piece, "") + "\n\n")
+			})
+			write(conn, "data: " + chunk_json(id, created, "", "stop") + "\n\n")
+			write(conn, "data: [DONE]\n\n")
+			mu_rel <- 1
+		})
+		return
+	}
+	lk := <-mu_acq
+	lk = lk
+	if cr.seed > 0 { rng_seed(cr.seed) } else { rng_seed(now_ms() & 2147483647) }
+	out := []string{}
+	n := generate_cb(toks, cr.max_tokens, cr.temperature, cr.top_p, func(piece) {
+		out = append(out, piece)
+	})
+	reused := gen_prefill_reused
+	mu_rel <- 1
+	body := "{\"id\":\"" + id + "\",\"object\":\"chat.completion\",\"created\":" + str(created) + ",\"model\":\"" + model_id + "\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"" + json_esc(join(out, "")) + "\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":" + str(len(toks)) + ",\"completion_tokens\":" + str(n) + ",\"total_tokens\":" + str(len(toks) + n) + ",\"prompt_tokens_cached\":" + str(reused) + "}}"
+	res = ok_json(body)
+	return
+}
+
+func api_route(req) (res) {
+	if req.method == "GET" && req.path == "/v1/models" { res = handle_models()  return }
+	if req.method == "POST" && req.path == "/v1/chat/completions" { res = handle_chat(req)  return }
+	if req.method == "GET" && req.path == "/health" { res = ok_json("{\"ok\":true,\"model\":\"" + model_id + "\"}")  return }
+	res = ok_json("{\"error\":{\"message\":\"not found\",\"type\":\"invalid_request_error\"}}")
+	res.status = "404 Not Found"
+	return
+}
+
+func main() {
+	a := args()
+	model := "models/tinyllama-1.1b-q80.bin"
+	port := 8090
+	if len(a) > 1 { model = a[1] }
+	if len(a) > 2 { port = parse_int(a[2]) }
+	nw := parse_int(env("COLIBRI_THREADS"))
+	if nw > 0 { n_workers = nw } else { n_workers = 6 }
+	t0 := now_ms()
+	load_model(model)
+	alloc_state()
+	load_tokenizer("models/tokenizer.bin")
+	w := 0
+	while w < n_workers { go worker(jobs, done)  w = w + 1 }
+	go mutex_srv(mu_acq, mu_rel)
+	println("colibri serve: model=" + model_id + " dim=" + str(dim) + " layers=" + str(n_layers) + " workers=" + str(n_workers) + " loaded in " + str(now_ms() - t0) + " ms")
+	println("OpenAI-compatible API on http://0.0.0.0:" + str(port) + "/v1")
+	serve(port, func(req) { return api_route(req) })
+}
