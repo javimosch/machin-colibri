@@ -489,6 +489,9 @@ func main() {
 	if len(a) > 2 { port = parse_int(a[2]) }
 	nw := parse_int(env("COLIBRI_THREADS"))
 	if nw > 0 { n_workers = nw } else { n_workers = 6 }
+	if parse_int(env("COLIBRI_NOBATCH")) == 1 { pb_enabled = 0 }
+	tl := parse_int(env("COLIBRI_TILE"))
+	if tl > 0 { pb_tile = tl } // must be set before alloc_state sizes the batch buffers
 	t0 := now_ms()
 	load_model(model)
 	alloc_state()

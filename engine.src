@@ -132,6 +132,15 @@ func load_model(path) {
 	w2_b = o         o = o + n_layers * qblock(hidden_dim * dim)
 	w3_b = o         o = o + n_layers * qblock(dim * hidden_dim)
 	if shared_cls == 1 { wcls_b = w_tok } else { wcls_b = o }
+	// precompute the RoPE frequency per dim-pair once: rope_freq(hd) depends only
+	// on hd (+ theta/scaling), NOT position — computing pow() per element per
+	// token was ~16M pow calls in a long prefill. Table has head_size/2 entries.
+	rope_freqs = alloc((head_size / 2) * 4)
+	hd := 0
+	while hd < head_size {
+		poke_f32(rope_freqs, (hd / 2) * 4, rope_freq(hd))
+		hd = hd + 2
+	}
 }
 
 func alloc_state() {
@@ -150,6 +159,7 @@ func alloc_state() {
 	s_hq = alloc(hidden_dim)
 	s_hq_s = alloc((hidden_dim / gs) * 4)
 	cache_buf = alloc(seq_len * 4) // persistent prefix-cache token bookkeeping
+	alloc_prefill()
 }
 
 func load_tokenizer(path) {
@@ -335,7 +345,7 @@ func rope(l, pos) {
 	i := 0
 	while i < dim {
 		hd := i % head_size
-		freq := rope_freq(hd)
+		freq := peek_f32(rope_freqs, (hd/2)*4)
 		val := float(pos) * freq
 		fcr := cos(val)
 		fci := sin(val)
@@ -391,20 +401,150 @@ func attn_head(h, l, pos) {
 	}
 }
 
+// ---- batched prefill ----
+// The per-token forward re-streams ALL weights from RAM for every prompt token
+// (O(n) full weight reads -> ~1.3GB x n_tokens of traffic). Batched prefill runs
+// a TILE of positions through each layer together, so each weight row is loaded
+// once and reused across the whole tile (GEMM, not n GEMVs) -- the prefill cost
+// drops from ~weight-streaming-bound to compute-bound. Attention (inherently
+// O(n^2)) is parallelized over head x position.
+var pb_tile = 256
+var pb_enabled = 1  // COLIBRI_NOBATCH=1 forces per-token prefill (A/B correctness)
+var pb_B = 0        // current tile size
+var pb_tstart = 0   // absolute position of the tile's first token
+var pb_x = 0        // TILE x dim  (residual stream)
+var pb_xb = 0       // TILE x dim  (normed / attn out)
+var pb_xb2 = 0      // TILE x dim  (o-proj out)
+var pb_q = 0        // TILE x dim  (queries)
+var pb_hb = 0       // TILE x hidden
+var pb_hb2 = 0      // TILE x hidden
+var pb_xq = 0       // TILE x dim  int8
+var pb_xqs = 0      // TILE x (dim/gs) f32
+var pb_hq = 0       // TILE x hidden int8
+var pb_hqs = 0      // TILE x (hidden/gs) f32
+
+func alloc_prefill() {
+	t := pb_tile
+	pb_x = alloc(t * dim * 4)
+	pb_xb = alloc(t * dim * 4)
+	pb_xb2 = alloc(t * dim * 4)
+	pb_q = alloc(t * dim * 4)
+	pb_hb = alloc(t * hidden_dim * 4)
+	pb_hb2 = alloc(t * hidden_dim * 4)
+	pb_xq = alloc(t * dim)
+	pb_xqs = alloc(t * (dim / gs) * 4)
+	pb_hq = alloc(t * hidden_dim)
+	pb_hqs = alloc(t * (hidden_dim / gs) * 4)
+}
+
+// batched int8 matmul: out[b][i] = W[i,:] . xq[b][:], for b in 0..B, i in lo..hi.
+// out is row-major with row stride `ostride` (dim for a dense buffer, kv_dim for
+// the KV cache tile). Weight row i (wrow) is loaded ONCE and reused across all B
+// positions -- the whole point. xqb/xsb are TILE-major (row stride n / n/gs).
+func matmul_q_batch(ob, ostride, xqb, xsb, wq, ws, n, lo, hi, B) {
+	i := lo
+	while i < hi {
+		in := i * n
+		wrow := wbuf + wq + in
+		wsb := ws + (in / gs) * 4
+		b := 0
+		while b < B {
+			val := 0.0
+			xq := xqb + b * n
+			xs := xsb + b * (n / gs) * 4
+			j := 0
+			g := 0
+			while j < n {
+				ival := dot_i8(xq + j, wrow + j, gs)
+				val = val + float(ival) * peek_f32(wbuf, wsb + g*4) * peek_f32(xs, g*4)
+				j = j + gs
+				g = g + 1
+			}
+			poke_f32(ob, (b * ostride + i) * 4, val)
+			b = b + 1
+		}
+		i = i + 1
+	}
+}
+
+// attention for one (head, position) with an explicit query base, output base,
+// and per-worker score scratch (so parallel head x position units don't collide
+// on shared state).
+func attn_head_at(h, l, pos, qbase, obase, att) {
+	loff := l * seq_len * kv_dim
+	kv_mul := n_heads / n_kv_heads
+	qh := qbase + h * head_size * 4
+	t := 0
+	while t <= pos {
+		kt := s_key_cache + (loff + t * kv_dim + (h / kv_mul) * head_size) * 4
+		score := 0.0
+		j := 0
+		while j < head_size {
+			score = score + peek_f32(qh, j*4) * peek_f32(kt, j*4)
+			j = j + 1
+		}
+		poke_f32(att, t*4, score / sqrt(float(head_size)))
+		t = t + 1
+	}
+	softmax(att, pos + 1)
+	xbh := obase + h * head_size * 4
+	j := 0
+	while j < head_size {
+		poke_f32(xbh, j*4, 0.0)
+		j = j + 1
+	}
+	t = 0
+	while t <= pos {
+		vt := s_val_cache + (loff + t * kv_dim + (h / kv_mul) * head_size) * 4
+		a := peek_f32(att, t*4)
+		j = 0
+		while j < head_size {
+			poke_f32(xbh, j*4, peek_f32(xbh, j*4) + a * peek_f32(vt, j*4))
+			j = j + 1
+		}
+		t = t + 1
+	}
+}
+
+// rope for a batch position: rotate the query in qbase and the cached key at pos.
+func rope_at(l, pos, qbase) {
+	kptr := s_key_cache + (l * seq_len * kv_dim + pos * kv_dim) * 4
+	i := 0
+	while i < dim {
+		hd := i % head_size
+		freq := peek_f32(rope_freqs, (hd/2)*4)
+		val := float(pos) * freq
+		fcr := cos(val)
+		fci := sin(val)
+		q0 := peek_f32(qbase, i*4)
+		q1 := peek_f32(qbase, i*4+4)
+		poke_f32(qbase, i*4, q0 * fcr - q1 * fci)
+		poke_f32(qbase, i*4+4, q0 * fci + q1 * fcr)
+		if i < kv_dim {
+			k0 := peek_f32(kptr, i*4)
+			k1 := peek_f32(kptr, i*4+4)
+			poke_f32(kptr, i*4, k0 * fcr - k1 * fci)
+			poke_f32(kptr, i*4+4, k0 * fci + k1 * fcr)
+		}
+		i = i + 2
+	}
+}
+
 // ---- worker pool: jobs are packed ints, results land in disjoint buffer rows ----
 // job = type | layer<<4 | pos<<12 | lo<<24 | hi<<44
 // types: 0 wq  1 wk  2 wv  3 wo  4 w1  5 w3  6 w2  7 wcls  8 attention heads
+//        9 fused-qkv  10 fused-w1w3   11-17 batched matmuls  18 batched attention
 var n_workers = 1
 var jobs = make(chan int)
 var done = make(chan int)
 var pending = 0
 
-func do_job(j, sc) {
-	t := j & 15
-	l := (j >> 4) & 255
-	pos := (j >> 12) & 4095
-	lo := (j >> 24) & 1048575
-	hi := j >> 44
+func do_job(j, sc, att) {
+	t := j & 31
+	l := (j >> 5) & 255
+	pos := (j >> 13) & 4095
+	lo := (j >> 25) & 524287
+	hi := (j >> 44) & 524287
 	if t == 0 { mmj(s_q, s_xq, s_xq_s, wq_b + l * qblock(dim*dim), dim*dim, dim, lo, hi, sc) }
 	if t == 1 {
 		kptr := s_key_cache + (l * seq_len * kv_dim + pos * kv_dim) * 4
@@ -438,12 +578,69 @@ func do_job(j, sc) {
 		mmj(s_hb, s_xq, s_xq_s, w1_b + l * qblock(dim*hidden_dim), dim*hidden_dim, dim, lo, hi, sc)
 		mmj(s_hb2, s_xq, s_xq_s, w3_b + l * qblock(dim*hidden_dim), dim*hidden_dim, dim, lo, hi, sc)
 	}
+	// ---- batched prefill jobs (read pb_B / pb_tstart globals) ----
+	if t == 11 { qb := wq_b + l * qblock(dim*dim)  matmul_q_batch(pb_q, dim, pb_xq, pb_xqs, qb, qb + dim*dim, dim, lo, hi, pb_B) }
+	if t == 12 { kb := wk_b + l * qblock(dim*kv_dim)  matmul_q_batch(s_key_cache + (l*seq_len*kv_dim + pb_tstart*kv_dim)*4, kv_dim, pb_xq, pb_xqs, kb, kb + dim*kv_dim, dim, lo, hi, pb_B) }
+	if t == 13 { vb := wv_b + l * qblock(dim*kv_dim)  matmul_q_batch(s_val_cache + (l*seq_len*kv_dim + pb_tstart*kv_dim)*4, kv_dim, pb_xq, pb_xqs, vb, vb + dim*kv_dim, dim, lo, hi, pb_B) }
+	if t == 14 { ob := wo_b + l * qblock(dim*dim)  matmul_q_batch(pb_xb2, dim, pb_xq, pb_xqs, ob, ob + dim*dim, dim, lo, hi, pb_B) }
+	if t == 15 { wb := w1_b + l * qblock(dim*hidden_dim)  matmul_q_batch(pb_hb, hidden_dim, pb_xq, pb_xqs, wb, wb + dim*hidden_dim, dim, lo, hi, pb_B) }
+	if t == 16 { wb := w3_b + l * qblock(dim*hidden_dim)  matmul_q_batch(pb_hb2, hidden_dim, pb_xq, pb_xqs, wb, wb + dim*hidden_dim, dim, lo, hi, pb_B) }
+	if t == 17 { wb := w2_b + l * qblock(hidden_dim*dim)  matmul_q_batch(pb_xb, dim, pb_hq, pb_hqs, wb, wb + hidden_dim*dim, hidden_dim, lo, hi, pb_B) }
+	if t == 18 { // batched attention over flattened (b*n_heads + head) units
+		u := lo
+		while u < hi {
+			b := u / n_heads
+			h := u % n_heads
+			attn_head_at(h, l, pb_tstart + b, pb_q + b*dim*4, pb_xb + b*dim*4, att)
+			u = u + 1
+		}
+	}
+	// ---- batched elementwise glue, parallelized over positions [lo,hi) ----
+	if t == 19 { // att rmsnorm(pb_x -> pb_xb) + quantize(-> pb_xq)
+		b := lo
+		while b < hi { rmsnorm(pb_xb + b*dim*4, pb_x + b*dim*4, wbuf + w_rms_att + l*dim*4, dim)  quantize_act(pb_xq + b*dim, pb_xqs + b*(dim/gs)*4, pb_xb + b*dim*4, dim)  b = b + 1 }
+	}
+	if t == 20 { // ffn rmsnorm(pb_x -> pb_xb) + quantize(-> pb_xq)
+		b := lo
+		while b < hi { rmsnorm(pb_xb + b*dim*4, pb_x + b*dim*4, wbuf + w_rms_ffn + l*dim*4, dim)  quantize_act(pb_xq + b*dim, pb_xqs + b*(dim/gs)*4, pb_xb + b*dim*4, dim)  b = b + 1 }
+	}
+	if t == 21 { // quantize pb_xb (attn output) -> pb_xq
+		b := lo
+		while b < hi { quantize_act(pb_xq + b*dim, pb_xqs + b*(dim/gs)*4, pb_xb + b*dim*4, dim)  b = b + 1 }
+	}
+	if t == 22 { // residual pb_x += pb_xb2
+		b := lo
+		while b < hi { i := 0  while i < dim { poke_f32(pb_x + b*dim*4, i*4, peek_f32(pb_x + b*dim*4, i*4) + peek_f32(pb_xb2 + b*dim*4, i*4))  i = i + 1 }  b = b + 1 }
+	}
+	if t == 23 { // silu(pb_hb)*pb_hb2 -> pb_hb, quantize -> pb_hq
+		b := lo
+		while b < hi {
+			i := 0
+			while i < hidden_dim {
+				v := peek_f32(pb_hb + b*hidden_dim*4, i*4)
+				v = v * (1.0 / (1.0 + exp(0.0 - v)))
+				poke_f32(pb_hb + b*hidden_dim*4, i*4, v * peek_f32(pb_hb2 + b*hidden_dim*4, i*4))
+				i = i + 1
+			}
+			quantize_act(pb_hq + b*hidden_dim, pb_hqs + b*(hidden_dim/gs)*4, pb_hb + b*hidden_dim*4, hidden_dim)
+			b = b + 1
+		}
+	}
+	if t == 24 { // residual pb_x += pb_xb
+		b := lo
+		while b < hi { i := 0  while i < dim { poke_f32(pb_x + b*dim*4, i*4, peek_f32(pb_x + b*dim*4, i*4) + peek_f32(pb_xb + b*dim*4, i*4))  i = i + 1 }  b = b + 1 }
+	}
+	if t == 25 { // batched rope over positions [lo,hi)
+		b := lo
+		while b < hi { rope_at(l, pb_tstart + b, pb_q + b*dim*4)  b = b + 1 }
+	}
 }
 
 func worker(jc, dc) {
-	sc := alloc(hidden_dim) // per-worker int4 row-unpack scratch (covers widest row)
+	sc := alloc(hidden_dim)  // per-worker int4 row-unpack scratch (covers widest row)
+	att := alloc(seq_len * 4) // per-worker attention score scratch (batched attn)
 	for j := range jc {
-		do_job(j, sc)
+		do_job(j, sc, att)
 		dc <- 1
 	}
 }
@@ -460,7 +657,7 @@ func dispatch_rows(t, l, pos, d) {
 		hi := lo + chunk
 		if hi > d { hi = d }
 		if pending >= n_workers { <-done  pending = pending - 1 }
-		jobs <- (t | l << 4 | pos << 12 | lo << 24 | hi << 44)
+		jobs <- (t | l << 5 | pos << 13 | lo << 25 | hi << 44)
 		pending = pending + 1
 		lo = hi
 	}
@@ -709,6 +906,60 @@ func cache_common(toks) (l) {
 	return
 }
 
+// int8 token embedding into an arbitrary destination buffer (batched prefill)
+func embed_to(token, dst) {
+	row := token * dim
+	sbase := w_tok + vocab_size * dim
+	i := 0
+	while i < dim {
+		poke_f32(dst, i*4, float(peek_i8(wbuf, w_tok + row + i)) * peek_f32(wbuf, sbase + ((row+i)/gs)*4))
+		i = i + 1
+	}
+}
+
+// batched prefill of positions [start, np): store K/V for those positions and
+// leave s_logits = logits for position np-1. int8 only (batched fast path).
+func prefill_batch(toks, start, np) {
+	ts := start
+	while ts < np {
+		te := ts + pb_tile
+		if te > np { te = np }
+		B := te - ts
+		pb_B = B
+		pb_tstart = ts
+		b := 0
+		while b < B { embed_to(toks[ts+b], pb_x + b*dim*4)  b = b + 1 }
+		l := 0
+		while l < n_layers {
+			dispatch_rows(19, l, 0, B)  barrier()        // att rmsnorm+quant  (parallel over positions)
+			dispatch_rows(11, l, 0, dim)  barrier()      // Q
+			dispatch_rows(12, l, 0, kv_dim)  barrier()   // K -> cache
+			dispatch_rows(13, l, 0, kv_dim)  barrier()   // V -> cache
+			dispatch_rows(25, l, 0, B)  barrier()        // rope (parallel over positions)
+			dispatch_rows(18, l, 0, B * n_heads)  barrier() // attention -> pb_xb
+			dispatch_rows(21, l, 0, B)  barrier()        // quantize attn output
+			dispatch_rows(14, l, 0, dim)  barrier()       // O -> pb_xb2
+			dispatch_rows(22, l, 0, B)  barrier()        // residual x += xb2
+			dispatch_rows(20, l, 0, B)  barrier()        // ffn rmsnorm+quant
+			dispatch_rows(15, l, 0, hidden_dim)  barrier() // w1 -> pb_hb
+			dispatch_rows(16, l, 0, hidden_dim)  barrier() // w3 -> pb_hb2
+			dispatch_rows(23, l, 0, B)  barrier()        // silu*w3 + quant
+			dispatch_rows(17, l, 0, dim)  barrier()        // w2 -> pb_xb
+			dispatch_rows(24, l, 0, B)  barrier()        // residual x += xb
+			l = l + 1
+		}
+		if te == np {
+			// last tile's last position -> s_x, then final norm + classifier
+			i := 0
+			while i < dim { poke_f32(s_x, i*4, peek_f32(pb_x + (B-1)*dim*4, i*4))  i = i + 1 }
+		}
+		ts = te
+	}
+	rmsnorm(s_x, s_x, wbuf + w_rms_final, dim)
+	quantize_act(s_xq, s_xq_s, s_x, dim)
+	dispatch_rows(7, 0, 0, vocab_size)  barrier()
+}
+
 // generate: prefill prompt toks (reusing cached KV prefix), then decode up to
 // max_new tokens. emit(piece) is called per decoded piece; returns generated count.
 // Also returns via globals: gen_prefill_reused (tokens skipped thanks to cache).
@@ -719,10 +970,16 @@ func generate_cb(toks, max_new, temp, topp, emit) (gen) {
 	start := cache_common(toks)
 	if start >= np { start = np - 1 } // always re-forward the last prompt token for fresh logits
 	gen_prefill_reused = start
-	i := start
-	while i < np {
-		forward(toks[i], i)
-		i = i + 1
+	// batched prefill when there's a worthwhile run of new tokens (int8 only);
+	// otherwise the per-token path (also the int4 path, which has no batch kernel)
+	if np - start >= 16 && quant4 == 0 && pb_enabled == 1 {
+		prefill_batch(toks, start, np)
+	} else {
+		i := start
+		while i < np {
+			forward(toks[i], i)
+			i = i + 1
+		}
 	}
 	// record the prompt tokens into the persistent cache buffer
 	i = 0
@@ -755,6 +1012,7 @@ func bpe_encode_raw(text) (toks) {
 
 // ---- Llama-3 support: v4 header, RoPE scaling, tiktoken BPE ----
 
+var rope_freqs = 0 // precomputed rope_freq(hd) table, head_size/2 entries
 var rope_theta = 10000.0
 var l3_scaling = 0
 var l3_factor = 1.0
