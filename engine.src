@@ -256,16 +256,8 @@ func quantize_act(xq, xs, x, n) {
 func matmul_q(xout, xq, xs, wq, ws, n, lo, hi) {
 	i := lo
 	while i < hi {
-		val := 0.0
 		in := i * n
-		wrow := wbuf + wq + in
-		j := 0
-		while j < n {
-			ival := dot_i8(xq + j, wrow + j, gs)
-			val = val + float(ival) * peek_f32(wbuf, ws + ((in+j)/gs)*4) * peek_f32(xs, (j/gs)*4)
-			j = j + gs
-		}
-		poke_f32(xout, i*4, val)
+		poke_f32(xout, i*4, dot_q8(xq, xs, wbuf + wq + in, wbuf + ws + (in/gs)*4, n, gs))
 		i = i + 1
 	}
 }
@@ -442,25 +434,15 @@ func alloc_prefill() {
 // the KV cache tile). Weight row i (wrow) is loaded ONCE and reused across all B
 // positions -- the whole point. xqb/xsb are TILE-major (row stride n / n/gs).
 func matmul_q_batch(ob, ostride, xqb, xsb, wq, ws, n, lo, hi, B) {
+	 nsc := (n / gs) * 4
 	i := lo
 	while i < hi {
 		in := i * n
 		wrow := wbuf + wq + in
-		wsb := ws + (in / gs) * 4
+		wsp := wbuf + ws + (in / gs) * 4
 		b := 0
 		while b < B {
-			val := 0.0
-			xq := xqb + b * n
-			xs := xsb + b * (n / gs) * 4
-			j := 0
-			g := 0
-			while j < n {
-				ival := dot_i8(xq + j, wrow + j, gs)
-				val = val + float(ival) * peek_f32(wbuf, wsb + g*4) * peek_f32(xs, g*4)
-				j = j + gs
-				g = g + 1
-			}
-			poke_f32(ob, (b * ostride + i) * 4, val)
+			poke_f32(ob, (b * ostride + i) * 4, dot_q8(xqb + b*n, xsb + b*nsc, wrow, wsp, n, gs))
 			b = b + 1
 		}
 		i = i + 1
