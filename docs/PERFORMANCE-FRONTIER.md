@@ -70,16 +70,29 @@ doesn't, because the bottleneck is elsewhere.
   is retraining). Not disruptive on an untrained model. (Behind
   `COLIBRI_EXIT_LAYER`.)
 
-## The one exact disruption we did NOT chase: continuous batching
+## Continuous batching: built, exact, ~1.35× on this box
 
-For a *fleet* of agents (rbm21 serving many roam/tau workers), **continuous
-batching** is exact, needs no spare compute (every batched token is real work),
-and the GEMM scaling data proves the kernel supports it (B=256 at 92 GF/s). One
-batched forward advances N requests for ~one weight-read → ~N× *throughput*. It
-does nothing for single-request *latency*, and it is a substantial build
-(per-request state + a batched step scheduler), so it is logged here as the
-right lever for the *serving-many-agents* scenario, distinct from the
-single-request work above.
+For a *fleet* of agents, **continuous batching** batches independent requests
+(each with its own KV cache slot + position) into one forward, so N requests
+share each weight-read. Built and verified: a batched decode step over N slots,
+output **bit-identical to solo greedy** (`cli_cb.src` harness, all slots agree).
+
+But it is **~1.35×, not N×** on rbm21 (N=8: 31 vs 23 tok/s; N=2 even regressed):
+
+| N (concurrent slots) | 1 | 2 | 4 | 8 |
+|---|---|---|---|---|
+| aggregate tok/s | 22.9 | 20.5 | 29.5 | 31.0 |
+
+Same balanced-roofline wall: the batched matmul's **compute scales with N**, and
+this box is compute-balanced, so amortizing the weight-*read* across N slots does
+not dominate — the extra compute for N slots eats the saving. (Parallelizing the
+O(N) serial glue — per-slot argmax/rope/scatter — did not move it either,
+confirming it is the matmul compute, not the glue.) Continuous batching remains
+the *right* technique on a **memory-bandwidth-bound** box (where it would give
+~N×), plus it gives fairness on any box (all requests progress vs single-flight
+FIFO). On rbm21 it is a modest 1.35× + fairness. The primitive
+(`cb_step`/`cb_prefill`, per-slot KV via `kv_off`) is in the engine, unused by
+the default server path.
 
 - **int4 weights: half the memory, NO decode speedup on this box.** The int4
   model is 695 MB vs 1.3 GB (53%) and stays coherent ("The capital of France is

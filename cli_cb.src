@@ -1,0 +1,52 @@
+// continuous-batching test harness: compose with engine.src.
+// Prefills N slots with the same prompt, batched-decodes, checks all slots
+// produce identical greedy output (correctness) and reports aggregate tok/s.
+func main() {
+	a := args()
+	model := "models/llama32-1b-q80.bin"
+	N := 4
+	steps := 32
+	prompt := "The capital of France is"
+	if len(a) > 1 { model = a[1] }
+	if len(a) > 2 { N = parse_int(a[2]) }
+	if len(a) > 3 { steps = parse_int(a[3]) }
+	if len(a) > 4 { prompt = a[4] }
+	nw := parse_int(env("COLIBRI_THREADS"))
+	if nw > 0 { n_workers = nw } else { n_workers = 6 }
+	load_model(model)
+	alloc_state()
+	load_tokenizer_auto()
+	w := 0
+	while w < n_workers { go worker(jobs, done)  w = w + 1 }
+	toks := encode_text(prompt)
+	np := len(toks)
+	// prefill each slot independently (same prompt -> should decode identically)
+	s := 0
+	while s < N { cb_prefill(s, toks, np)  s = s + 1 }
+	s = 0
+	while s < N { poke_i32(cb_active, s*4, s)  s = s + 1 }
+	// record slot 0's stream for coherence; per-step, verify all slots agree
+	out0 := []int{}
+	out0 = append(out0, peek_i32(cb_curtok, 0))
+	allmatch := 1
+	t0 := now_ms()
+	i := 0
+	while i < steps {
+		cb_step(N)
+		tok0 := peek_i32(cb_curtok, 0)
+		out0 = append(out0, tok0)
+		s = 1
+		while s < N { if peek_i32(cb_curtok, s*4) != tok0 { allmatch = 0 }  s = s + 1 }
+		i = i + 1
+	}
+	t1 := now_ms()
+	total := N * (steps + 1)
+	txt := ""
+	prev := toks[np-1]
+	k := 0
+	while k < len(out0) { txt = txt + piece_text(prev, out0[k])  prev = out0[k]  k = k + 1 }
+	println("slot0: " + txt)
+	amv := "YES"
+	if allmatch == 0 { amv = "NO" }
+	println("N=" + str(N) + " steps=" + str(steps) + " all-slots-identical=" + amv + " | total=" + str(total) + " tok  time=" + str(t1-t0) + "ms  aggregate=" + str(float(total*1000)/float(t1-t0)) + " tok/s")
+}

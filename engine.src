@@ -43,6 +43,14 @@ var s_att = 0
 var s_logits = 0
 var s_key_cache = 0
 var s_val_cache = 0
+var kv_off = 0      // element offset into the KV cache for the current slot (continuous batching); 0 = slot 0 (solo default)
+var slotstride = 0 // n_layers*seq_len*kv_dim, one slot's KV region
+var cb_slots = 8   // max concurrent requests (continuous batching)
+var cb_active = 0  // int[cb_slots]: slot ids in the current step's batch
+var cb_pos = 0     // int[cb_slots]: per-slot decode position (indexed by slot id)
+var cb_curtok = 0  // int[cb_slots]: per-slot current token (indexed by slot id)
+var cb_kt = 0      // cb_slots x kv_dim: K temp for the step
+var cb_vt = 0      // cb_slots x kv_dim: V temp for the step
 var s_xq = 0    // quantized activation values (int8 bytes)
 var s_xq_s = 0  // fp32 group scales
 var s_hq = 0
@@ -154,8 +162,9 @@ func alloc_state() {
 	s_q = alloc(dim * 4)
 	s_att = alloc(n_heads * seq_len * 4)
 	s_logits = alloc(vocab_size * 4)
-	s_key_cache = alloc(n_layers * seq_len * kv_dim * 4)
-	s_val_cache = alloc(n_layers * seq_len * kv_dim * 4)
+	slotstride = n_layers * seq_len * kv_dim
+	s_key_cache = alloc(cb_slots * slotstride * 4)  // per-slot KV (slot 0 = solo default)
+	s_val_cache = alloc(cb_slots * slotstride * 4)
 	s_xq = alloc(dim)
 	s_xq_s = alloc((dim / gs) * 4)
 	s_hq = alloc(hidden_dim)
@@ -163,6 +172,11 @@ func alloc_state() {
 	cache_buf = alloc(seq_len * 4) // persistent prefix-cache token bookkeeping
 	alloc_prefill()
 	alloc_spec()
+	cb_active = alloc(cb_slots * 4)
+	cb_pos = alloc(cb_slots * 4)
+	cb_curtok = alloc(cb_slots * 4)
+	cb_kt = alloc(cb_slots * kv_dim * 4)
+	cb_vt = alloc(cb_slots * kv_dim * 4)
 }
 
 func load_tokenizer(path) {
@@ -312,7 +326,7 @@ func embed_token(token) {
 
 // RoPE: rotate adjacent pairs of q (all dims) and this position's cached k (kv dims)
 func rope(l, pos) {
-	kptr := s_key_cache + (l * seq_len * kv_dim + pos * kv_dim) * 4
+	kptr := s_key_cache + (kv_off + l * seq_len * kv_dim + pos * kv_dim) * 4
 	i := 0
 	while i < dim {
 		hd := i % head_size
@@ -342,7 +356,7 @@ func attn_head(h, l, pos) {
 	atth := s_att + h * seq_len * 4
 	t := 0
 	while t <= pos {
-		kt := s_key_cache + (loff + t * kv_dim + (h / kv_mul) * head_size) * 4
+		kt := s_key_cache + (kv_off + loff + t * kv_dim + (h / kv_mul) * head_size) * 4
 		score := 0.0
 		j := 0
 		while j < head_size {
@@ -361,7 +375,7 @@ func attn_head(h, l, pos) {
 	}
 	t = 0
 	while t <= pos {
-		vt := s_val_cache + (loff + t * kv_dim + (h / kv_mul) * head_size) * 4
+		vt := s_val_cache + (kv_off + loff + t * kv_dim + (h / kv_mul) * head_size) * 4
 		a := peek_f32(atth, t*4)
 		j = 0
 		while j < head_size {
@@ -441,7 +455,7 @@ func attn_head_at(h, l, pos, qbase, obase, att) {
 	qh := qbase + h * head_size * 4
 	t := 0
 	while t <= pos {
-		kt := s_key_cache + (loff + t * kv_dim + (h / kv_mul) * head_size) * 4
+		kt := s_key_cache + (kv_off + loff + t * kv_dim + (h / kv_mul) * head_size) * 4
 		poke_f32(att, t*4, dot_f32(qh, kt, head_size) / sqrt(float(head_size)))
 		t = t + 1
 	}
@@ -454,7 +468,7 @@ func attn_head_at(h, l, pos, qbase, obase, att) {
 	}
 	t = 0
 	while t <= pos {
-		vt := s_val_cache + (loff + t * kv_dim + (h / kv_mul) * head_size) * 4
+		vt := s_val_cache + (kv_off + loff + t * kv_dim + (h / kv_mul) * head_size) * 4
 		axpy_f32(xbh, peek_f32(att, t*4), vt, head_size)
 		t = t + 1
 	}
@@ -462,7 +476,7 @@ func attn_head_at(h, l, pos, qbase, obase, att) {
 
 // rope for a batch position: rotate the query in qbase and the cached key at pos.
 func rope_at(l, pos, qbase) {
-	kptr := s_key_cache + (l * seq_len * kv_dim + pos * kv_dim) * 4
+	kptr := s_key_cache + (kv_off + l * seq_len * kv_dim + pos * kv_dim) * 4
 	i := 0
 	while i < dim {
 		hd := i % head_size
@@ -501,11 +515,11 @@ func do_job(j, sc, att) {
 	hi := (j >> 44) & 524287
 	if t == 0 { mmj(s_q, s_xq, s_xq_s, wq_b + l * qblock(dim*dim), dim*dim, dim, lo, hi, sc) }
 	if t == 1 {
-		kptr := s_key_cache + (l * seq_len * kv_dim + pos * kv_dim) * 4
+		kptr := s_key_cache + (kv_off + l * seq_len * kv_dim + pos * kv_dim) * 4
 		mmj(kptr, s_xq, s_xq_s, wk_b + l * qblock(dim*kv_dim), dim*kv_dim, dim, lo, hi, sc)
 	}
 	if t == 2 {
-		vptr := s_val_cache + (l * seq_len * kv_dim + pos * kv_dim) * 4
+		vptr := s_val_cache + (kv_off + l * seq_len * kv_dim + pos * kv_dim) * 4
 		mmj(vptr, s_xq, s_xq_s, wv_b + l * qblock(dim*kv_dim), dim*kv_dim, dim, lo, hi, sc)
 	}
 	if t == 3 { mmj(s_xb2, s_xq, s_xq_s, wo_b + l * qblock(dim*dim), dim*dim, dim, lo, hi, sc) }
@@ -522,8 +536,8 @@ func do_job(j, sc, att) {
 		klo := (lo * kv_dim) / dim
 		khi := (hi * kv_dim) / dim
 		if khi > klo {
-			kptr := s_key_cache + (l * seq_len * kv_dim + pos * kv_dim) * 4
-			vptr := s_val_cache + (l * seq_len * kv_dim + pos * kv_dim) * 4
+			kptr := s_key_cache + (kv_off + l * seq_len * kv_dim + pos * kv_dim) * 4
+			vptr := s_val_cache + (kv_off + l * seq_len * kv_dim + pos * kv_dim) * 4
 			mmj(kptr, s_xq, s_xq_s, wk_b + l * qblock(dim*kv_dim), dim*kv_dim, dim, klo, khi, sc)
 			mmj(vptr, s_xq, s_xq_s, wv_b + l * qblock(dim*kv_dim), dim*kv_dim, dim, klo, khi, sc)
 		}
@@ -595,6 +609,72 @@ func do_job(j, sc, att) {
 	if t == 27 { // batched classifier -> spec_logits (B x vocab)
 		matmul_q_batch(spec_logits, vocab_size, pb_xq, pb_xqs, wcls_b, wcls_b + dim*vocab_size, dim, lo, hi, pb_B)
 	}
+	// ---- continuous-batch jobs: each batch slot is a DIFFERENT request ----
+	if t == 28 { kb := wk_b + l * qblock(dim*kv_dim)  matmul_q_batch(cb_kt, kv_dim, pb_xq, pb_xqs, kb, kb + dim*kv_dim, dim, lo, hi, pb_B) } // K -> cb_kt temp
+	if t == 29 { vb := wv_b + l * qblock(dim*kv_dim)  matmul_q_batch(cb_vt, kv_dim, pb_xq, pb_xqs, vb, vb + dim*kv_dim, dim, lo, hi, pb_B) } // V -> cb_vt temp
+	if t == 30 { // per-slot attention: unit u = j*n_heads + h; slot = cb_active[j], attend its own cache
+		u := lo
+		while u < hi {
+			jj := u / n_heads
+			hh := u % n_heads
+			attn_head_cb(jj, hh, l, att)
+			u = u + 1
+		}
+	}
+}
+
+// attention for continuous-batch slot jj, head hh: query pb_q[jj], attend slot's
+// own KV cache 0..pos, write pb_xb[jj]. Uses per-worker score scratch.
+func attn_head_cb(jj, hh, l, att) {
+	s := peek_i32(cb_active, jj*4)
+	pos := peek_i32(cb_pos, s*4)
+	loff := s * slotstride + l * seq_len * kv_dim
+	kv_mul := n_heads / n_kv_heads
+	qh := pb_q + jj*dim*4 + hh * head_size * 4
+	t := 0
+	while t <= pos {
+		kt := s_key_cache + (loff + t * kv_dim + (hh / kv_mul) * head_size) * 4
+		poke_f32(att, t*4, dot_f32(qh, kt, head_size) / sqrt(float(head_size)))
+		t = t + 1
+	}
+	softmax(att, pos + 1)
+	xbh := pb_xb + jj*dim*4 + hh * head_size * 4
+	j := 0
+	while j < head_size { poke_f32(xbh, j*4, 0.0)  j = j + 1 }
+	t = 0
+	while t <= pos {
+		vt := s_val_cache + (loff + t * kv_dim + (hh / kv_mul) * head_size) * 4
+		axpy_f32(xbh, peek_f32(att, t*4), vt, head_size)
+		t = t + 1
+	}
+}
+
+// rope Q (at qbase) and a key already stored at kdst, for absolute position pos.
+func rope_qk(pos, qbase, kdst) {
+	i := 0
+	while i < dim {
+		hd := i % head_size
+		freq := peek_f32(rope_freqs, (hd/2)*4)
+		val := float(pos) * freq
+		fcr := cos(val)
+		fci := sin(val)
+		q0 := peek_f32(qbase, i*4)
+		q1 := peek_f32(qbase, i*4+4)
+		poke_f32(qbase, i*4, q0 * fcr - q1 * fci)
+		poke_f32(qbase, i*4+4, q0 * fci + q1 * fcr)
+		if i < kv_dim {
+			k0 := peek_f32(kdst, i*4)
+			k1 := peek_f32(kdst, i*4+4)
+			poke_f32(kdst, i*4, k0 * fcr - k1 * fci)
+			poke_f32(kdst, i*4+4, k0 * fci + k1 * fcr)
+		}
+		i = i + 2
+	}
+}
+
+func copy_f32(dst, src, n) {
+	i := 0
+	while i < n { poke_f32(dst, i*4, peek_f32(src, i*4))  i = i + 1 }
 }
 
 func worker(jc, dc) {
@@ -1127,6 +1207,73 @@ func generate_cb(toks, max_new, temp, topp, emit) (gen) {
 		flush()
 	}
 	return
+}
+
+// ---- continuous batching: one batched forward advances every active slot by
+// one token (weights read once for the whole batch = ~N x throughput). Each
+// slot is an independent request with its own KV cache region and position. ----
+
+// prefill slot `sl` with its prompt tokens (into slot sl's KV region), leaving
+// cb_pos[sl] and cb_curtok[sl] set for the first decode step. Uses the per-token
+// path via kv_off (slot-aware); batched prefill is slot-0 only.
+func cb_prefill(sl, toks, np) {
+	kv_off = sl * slotstride
+	i := 0
+	while i < np { forward(toks[i], i)  i = i + 1 }
+	kv_off = 0
+	poke_i32(cb_pos, sl*4, np)
+	poke_i32(cb_curtok, sl*4, argmax_logits())
+}
+
+// one batched decode step over M active slots (ids in cb_active[0..M-1]).
+// Advances each slot's position and sets its next token.
+func cb_step(M) {
+	pb_B = M
+	j := 0
+	while j < M { embed_to(peek_i32(cb_curtok, peek_i32(cb_active, j*4)*4), pb_x + j*dim*4)  j = j + 1 }
+	l := 0
+	while l < n_layers {
+		dispatch_rows(19, l, 0, M)  barrier()          // rmsnorm+quant -> pb_xq
+		dispatch_rows(11, l, 0, dim)  barrier()        // Q -> pb_q
+		dispatch_rows(28, l, 0, kv_dim)  barrier()     // K -> cb_kt temp
+		dispatch_rows(29, l, 0, kv_dim)  barrier()     // V -> cb_vt temp
+		j = 0
+		while j < M {
+			s := peek_i32(cb_active, j*4)
+			pos := peek_i32(cb_pos, s*4)
+			koff := (s * slotstride + l * seq_len * kv_dim + pos * kv_dim) * 4
+			kdst := s_key_cache + koff
+			copy_f32(kdst, cb_kt + j*kv_dim*4, kv_dim)
+			copy_f32(s_val_cache + koff, cb_vt + j*kv_dim*4, kv_dim)
+			rope_qk(pos, pb_q + j*dim*4, kdst)
+			j = j + 1
+		}
+		dispatch_rows(30, l, 0, M * n_heads)  barrier() // per-slot attention -> pb_xb
+		dispatch_rows(21, l, 0, M)  barrier()          // quant attn out
+		dispatch_rows(14, l, 0, dim)  barrier()        // O -> pb_xb2
+		dispatch_rows(22, l, 0, M)  barrier()          // residual
+		dispatch_rows(20, l, 0, M)  barrier()          // ffn rmsnorm+quant
+		dispatch_rows(15, l, 0, hidden_dim)  barrier() // w1
+		dispatch_rows(16, l, 0, hidden_dim)  barrier() // w3
+		dispatch_rows(23, l, 0, M)  barrier()          // silu*w3
+		dispatch_rows(17, l, 0, dim)  barrier()        // w2
+		dispatch_rows(24, l, 0, M)  barrier()          // residual
+		l = l + 1
+	}
+	dispatch_rows(26, 0, 0, M)  barrier()          // final rmsnorm+quant
+	dispatch_rows(27, 0, 0, vocab_size)  barrier() // classifier -> spec_logits[j]
+	j = 0
+	while j < M {
+		s := peek_i32(cb_active, j*4)
+		base := spec_logits + j*vocab_size*4
+		best := 0
+		bv := peek_f32(base, 0)
+		i := 1
+		while i < vocab_size { v := peek_f32(base, i*4)  if v > bv { bv = v  best = i }  i = i + 1 }
+		poke_i32(cb_curtok, s*4, best)
+		poke_i32(cb_pos, s*4, peek_i32(cb_pos, s*4) + 1)
+		j = j + 1
+	}
 }
 
 // raw BPE encode without BOS/dummy-prefix (for mid-template segments)
