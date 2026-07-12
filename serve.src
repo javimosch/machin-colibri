@@ -490,6 +490,12 @@ func main() {
 	nw := parse_int(env("COLIBRI_THREADS"))
 	if nw > 0 { n_workers = nw } else { n_workers = 6 }
 	if parse_int(env("COLIBRI_NOBATCH")) == 1 { pb_enabled = 0 }
+	if parse_int(env("COLIBRI_SPEC")) == 1 { spec_enabled = 1 }
+	if parse_int(env("COLIBRI_SPARSE")) == 1 { sparse_probe = 1 }
+	el := parse_int(env("COLIBRI_EXIT_LAYER"))
+	if el > 0 { exit_layer = el }
+	sk := parse_int(env("COLIBRI_SPEC_K"))
+	if sk > 0 { spec_k = sk }
 	tl := parse_int(env("COLIBRI_TILE"))
 	if tl > 0 { pb_tile = tl } // must be set before alloc_state sizes the batch buffers
 	t0 := now_ms()

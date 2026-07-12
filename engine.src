@@ -97,7 +97,9 @@ func load_model(path) {
 	v4 := 0
 	if m == 1634415666 { quant4 = 0 } else { // 0x616b3432 "ak42" (int8 v2)
 		if m == 1634415667 { quant4 = 1 } else { // 0x616b3433 "ak43" (int4 v3)
-			if m == 1634415668 { quant4 = 0  v4 = 1 } else { println("bad magic (want ak42/ak43/ak44)")  exit(1) } // 0x616b3434 "ak44" (int8 + rope header)
+			if m == 1634415668 { quant4 = 0  v4 = 1 } else { // 0x616b3434 "ak44" (int8 + rope header)
+				if m == 1634415669 { quant4 = 1  v4 = 1 } else { println("bad magic (want ak42/ak43/ak44/ak45)")  exit(1) } // 0x616b3435 "ak45" (int4 + rope header)
+			}
 		}
 	}
 	dim = peek_i32(wbuf, 8)
@@ -160,6 +162,7 @@ func alloc_state() {
 	s_hq_s = alloc((hidden_dim / gs) * 4)
 	cache_buf = alloc(seq_len * 4) // persistent prefix-cache token bookkeeping
 	alloc_prefill()
+	alloc_spec()
 }
 
 func load_tokenizer(path) {
@@ -262,38 +265,14 @@ func matmul_q(xout, xq, xs, wq, ws, n, lo, hi) {
 	}
 }
 
-// int4 variant: 32-byte groups, byte i holds q[k=i] (low nibble) and q[k=i+32]
-// (high nibble), each stored as q+8. Two uniform half-group loops so the
-// nibble unpack autovectorizes.
+// int4 variant: split-nibble (byte k in a group holds w[k] low nibble and
+// w[k+gs/2] high nibble, each value+8). One dot_q4 call per output element does
+// the unpack + grouped dual-scaled dot, vectorized. sc unused (kept for mmj arity).
 func matmul_q4(xout, xq, xs, wq, ws, n, lo, hi, sc) {
-	h := gs / 2
 	i := lo
 	while i < hi {
-		// pass 1: unpack the whole int4 row into the worker's i8 scratch
-		wrow := wbuf + wq + i * (n / 2)
-		g := 0
-		while g < n / gs {
-			wg := wrow + g * h
-			sg := sc + g * gs
-			k := 0
-			while k < h {
-				b := peek_u8(wg, k)
-				poke_u8(sg, k, ((b & 15) - 8) & 255)
-				poke_u8(sg, k + h, ((b >> 4) - 8) & 255)
-				k = k + 1
-			}
-			g = g + 1
-		}
-		// pass 2: same i8 dot as the int8 kernel, reading from L1 scratch
-		val := 0.0
 		in := i * n
-		j := 0
-		while j < n {
-			ival := dot_i8(xq + j, sc + j, gs)
-			val = val + float(ival) * peek_f32(wbuf, ws + ((in+j)/gs)*4) * peek_f32(xs, (j/gs)*4)
-			j = j + gs
-		}
-		poke_f32(xout, i*4, val)
+		poke_f32(xout, i*4, dot_q4(xq, xs, wbuf + wq + i*(n/2), wbuf + ws + (in/gs)*4, n, gs))
 		i = i + 1
 	}
 }
@@ -402,6 +381,10 @@ func attn_head(h, l, pos) {
 // O(n^2)) is parallelized over head x position.
 var pb_tile = 256
 var pb_enabled = 1  // COLIBRI_NOBATCH=1 forces per-token prefill (A/B correctness)
+var prof_qkv = 0
+var prof_attn = 0
+var prof_o = 0
+var prof_ffn = 0
 var pb_B = 0        // current tile size
 var pb_tstart = 0   // absolute position of the tile's first token
 var pb_x = 0        // TILE x dim  (residual stream)
@@ -459,13 +442,7 @@ func attn_head_at(h, l, pos, qbase, obase, att) {
 	t := 0
 	while t <= pos {
 		kt := s_key_cache + (loff + t * kv_dim + (h / kv_mul) * head_size) * 4
-		score := 0.0
-		j := 0
-		while j < head_size {
-			score = score + peek_f32(qh, j*4) * peek_f32(kt, j*4)
-			j = j + 1
-		}
-		poke_f32(att, t*4, score / sqrt(float(head_size)))
+		poke_f32(att, t*4, dot_f32(qh, kt, head_size) / sqrt(float(head_size)))
 		t = t + 1
 	}
 	softmax(att, pos + 1)
@@ -478,12 +455,7 @@ func attn_head_at(h, l, pos, qbase, obase, att) {
 	t = 0
 	while t <= pos {
 		vt := s_val_cache + (loff + t * kv_dim + (h / kv_mul) * head_size) * 4
-		a := peek_f32(att, t*4)
-		j = 0
-		while j < head_size {
-			poke_f32(xbh, j*4, peek_f32(xbh, j*4) + a * peek_f32(vt, j*4))
-			j = j + 1
-		}
+		axpy_f32(xbh, peek_f32(att, t*4), vt, head_size)
 		t = t + 1
 	}
 }
@@ -616,6 +588,13 @@ func do_job(j, sc, att) {
 		b := lo
 		while b < hi { rope_at(l, pb_tstart + b, pb_q + b*dim*4)  b = b + 1 }
 	}
+	if t == 26 { // batched final rmsnorm + quantize (per position)
+		b := lo
+		while b < hi { rmsnorm(pb_xb + b*dim*4, pb_x + b*dim*4, wbuf + w_rms_final, dim)  quantize_act(pb_xq + b*dim, pb_xqs + b*(dim/gs)*4, pb_xb + b*dim*4, dim)  b = b + 1 }
+	}
+	if t == 27 { // batched classifier -> spec_logits (B x vocab)
+		matmul_q_batch(spec_logits, vocab_size, pb_xq, pb_xqs, wcls_b, wcls_b + dim*vocab_size, dim, lo, hi, pb_B)
+	}
 }
 
 func worker(jc, dc) {
@@ -653,7 +632,9 @@ func forward(token, pos) {
 	embed_token(token)
 	i := 0
 	l := 0
-	while l < n_layers {
+	nl := n_layers
+	if exit_layer > 0 && exit_layer < nl { nl = exit_layer }
+	while l < nl {
 		rmsnorm(s_xb, s_x, wbuf + w_rms_att + l * dim * 4, dim)
 		quantize_act(s_xq, s_xq_s, s_xb, dim)
 		dispatch_rows(9, l, pos, dim)  barrier()
@@ -671,6 +652,26 @@ func forward(token, pos) {
 		rmsnorm(s_xb, s_x, wbuf + w_rms_ffn + l * dim * 4, dim)
 		quantize_act(s_xq, s_xq_s, s_xb, dim)
 		dispatch_rows(10, l, pos, hidden_dim)  barrier()
+		if sparse_probe == 1 {
+			maxg := 0.0
+			j := 0
+			while j < hidden_dim { g := peek_f32(s_hb, j*4)  g = g * (1.0/(1.0+exp(0.0-g)))  ag := abs(g)  if ag > maxg { maxg = ag }  j = j + 1 }
+			thr := 0.1 * maxg
+			below := 0
+			keptmass := 0.0
+			totmass := 0.0
+			j = 0
+			while j < hidden_dim {
+				g := peek_f32(s_hb, j*4)  g = g * (1.0/(1.0+exp(0.0-g)))
+				h := abs(g * peek_f32(s_hb2, j*4))
+				totmass = totmass + h
+				if abs(g) < thr { below = below + 1 } else { keptmass = keptmass + h }
+				j = j + 1
+			}
+			sp_below = sp_below + below
+			sp_total = sp_total + hidden_dim
+			if totmass > 0.0 { sp_massk = sp_massk + keptmass / totmass  sp_massn = sp_massn + 1 }
+		}
 		i = 0
 		while i < hidden_dim {
 			v := peek_f32(s_hb, i*4)
@@ -901,6 +902,30 @@ func embed_to(token, dst) {
 
 // batched prefill of positions [start, np): store K/V for those positions and
 // leave s_logits = logits for position np-1. int8 only (batched fast path).
+// run the batched transformer layers for pb_B positions at [pb_tstart, ..),
+// assuming pb_x is embedded. Leaves final hidden states in pb_x, KV written.
+func batch_layers(B) {
+	l := 0
+	while l < n_layers {
+		dispatch_rows(19, l, 0, B)  barrier()          // att rmsnorm+quant
+		dispatch_rows(11, l, 0, dim)  barrier()        // Q
+		dispatch_rows(12, l, 0, kv_dim)  barrier()     // K -> cache
+		dispatch_rows(13, l, 0, kv_dim)  barrier()     // V -> cache
+		dispatch_rows(25, l, 0, B)  barrier()          // rope
+		dispatch_rows(18, l, 0, B * n_heads)  barrier() // attention -> pb_xb
+		dispatch_rows(21, l, 0, B)  barrier()          // quantize attn output
+		dispatch_rows(14, l, 0, dim)  barrier()        // O -> pb_xb2
+		dispatch_rows(22, l, 0, B)  barrier()          // residual x += xb2
+		dispatch_rows(20, l, 0, B)  barrier()          // ffn rmsnorm+quant
+		dispatch_rows(15, l, 0, hidden_dim)  barrier() // w1 -> pb_hb
+		dispatch_rows(16, l, 0, hidden_dim)  barrier() // w3 -> pb_hb2
+		dispatch_rows(23, l, 0, B)  barrier()          // silu*w3 + quant
+		dispatch_rows(17, l, 0, dim)  barrier()        // w2 -> pb_xb
+		dispatch_rows(24, l, 0, B)  barrier()          // residual x += xb
+		l = l + 1
+	}
+}
+
 func prefill_batch(toks, start, np) {
 	ts := start
 	while ts < np {
@@ -911,27 +936,8 @@ func prefill_batch(toks, start, np) {
 		pb_tstart = ts
 		b := 0
 		while b < B { embed_to(toks[ts+b], pb_x + b*dim*4)  b = b + 1 }
-		l := 0
-		while l < n_layers {
-			dispatch_rows(19, l, 0, B)  barrier()        // att rmsnorm+quant  (parallel over positions)
-			dispatch_rows(11, l, 0, dim)  barrier()      // Q
-			dispatch_rows(12, l, 0, kv_dim)  barrier()   // K -> cache
-			dispatch_rows(13, l, 0, kv_dim)  barrier()   // V -> cache
-			dispatch_rows(25, l, 0, B)  barrier()        // rope (parallel over positions)
-			dispatch_rows(18, l, 0, B * n_heads)  barrier() // attention -> pb_xb
-			dispatch_rows(21, l, 0, B)  barrier()        // quantize attn output
-			dispatch_rows(14, l, 0, dim)  barrier()       // O -> pb_xb2
-			dispatch_rows(22, l, 0, B)  barrier()        // residual x += xb2
-			dispatch_rows(20, l, 0, B)  barrier()        // ffn rmsnorm+quant
-			dispatch_rows(15, l, 0, hidden_dim)  barrier() // w1 -> pb_hb
-			dispatch_rows(16, l, 0, hidden_dim)  barrier() // w3 -> pb_hb2
-			dispatch_rows(23, l, 0, B)  barrier()        // silu*w3 + quant
-			dispatch_rows(17, l, 0, dim)  barrier()        // w2 -> pb_xb
-			dispatch_rows(24, l, 0, B)  barrier()        // residual x += xb
-			l = l + 1
-		}
+		batch_layers(B)
 		if te == np {
-			// last tile's last position -> s_x, then final norm + classifier
 			i := 0
 			while i < dim { poke_f32(s_x, i*4, peek_f32(pb_x + (B-1)*dim*4, i*4))  i = i + 1 }
 		}
@@ -940,6 +946,130 @@ func prefill_batch(toks, start, np) {
 	rmsnorm(s_x, s_x, wbuf + w_rms_final, dim)
 	quantize_act(s_xq, s_xq_s, s_x, dim)
 	dispatch_rows(7, 0, 0, vocab_size)  barrier()
+}
+
+// ---- speculative decoding (prompt-lookup): draft k tokens from n-gram matches
+// against the confirmed sequence, verify all in ONE batched forward (weights
+// read once). Exact: accepted tokens are bit-identical to greedy. ----
+var spec_enabled = 0  // COLIBRI_SPEC=1
+var sparse_probe = 0
+var exit_layer = 0  // COLIBRI_EXIT_LAYER: if >0, decode stops after this many layers
+var sp_below = 0
+var sp_total = 0
+var sp_massk = 0.0
+var sp_massn = 0
+var spec_k = 8
+var spec_maxb = 16
+var spec_logits = 0    // spec_maxb x vocab
+var spec_argmax = 0    // spec_maxb ints
+var spec_tbuf = 0      // spec_maxb ints (the batch's input tokens)
+
+func alloc_spec() {
+	spec_logits = alloc(spec_maxb * vocab_size * 4)
+	spec_argmax = alloc(spec_maxb * 4)
+	spec_tbuf = alloc(spec_maxb * 4)
+}
+
+// forward B tokens (in spec_tbuf) at positions [ts, ts+B): writes their KV and
+// leaves spec_argmax[b] = argmax of the logits at position ts+b (predicting ts+b+1).
+func spec_forward(ts, B) {
+	pb_B = B
+	pb_tstart = ts
+	b := 0
+	while b < B { embed_to(peek_i32(spec_tbuf, b*4), pb_x + b*dim*4)  b = b + 1 }
+	batch_layers(B)
+	dispatch_rows(26, 0, 0, B)  barrier()           // final rmsnorm + quant (per position)
+	dispatch_rows(27, 0, 0, vocab_size)  barrier()  // batched classifier -> spec_logits
+	b = 0
+	while b < B {
+		base := spec_logits + b*vocab_size*4
+		best := 0
+		bv := peek_f32(base, 0)
+		i := 1
+		while i < vocab_size {
+			v := peek_f32(base, i*4)
+			if v > bv { bv = v  best = i }
+			i = i + 1
+		}
+		poke_i32(spec_argmax, b*4, best)
+		b = b + 1
+	}
+}
+
+// prompt-lookup: last occurrence of the 2-gram ending at seq[n-1]; propose the
+// up-to-k tokens that followed it. Returns count written into a raw int buffer.
+func prompt_lookup(seq, n, k, out) (cnt) {
+	cnt = 0
+	if n < 3 { return }
+	t1 := peek_i32(seq, (n-2)*4)
+	t2 := peek_i32(seq, (n-1)*4)
+	i := n - 3
+	while i >= 1 {
+		if peek_i32(seq, (i-1)*4) == t1 && peek_i32(seq, i*4) == t2 {
+			j := i + 1
+			while j < n && cnt < k {
+				poke_i32(out, cnt*4, peek_i32(seq, j*4))
+				cnt = cnt + 1
+				j = j + 1
+			}
+			return
+		}
+		i = i - 1
+	}
+	return
+}
+
+var spec_steps = 0
+var spec_tokens = 0
+
+// speculative decode loop. cache_buf holds confirmed tokens; on entry `token`
+// is the token at position `pos` (KV not yet computed), cache_len = pos.
+// Returns generated count. emit(prev, tok) via the caller's decode.
+func spec_generate(pos0, token0, max_new, emit) (gen) {
+	pos := pos0
+	token := token0
+	gen = 0
+	draftbuf := alloc(spec_k * 4)
+	while gen < max_new && pos < seq_len {
+		if is_stop_token(token) { break }
+		poke_i32(cache_buf, pos*4, token)   // confirm token at pos (for lookup + KV bookkeeping)
+		k := spec_k
+		if pos + 1 + k >= seq_len { k = seq_len - pos - 2 }
+		nd := 0
+		if k > 0 { nd = prompt_lookup(cache_buf, pos+1, k, draftbuf) }
+		B := 1 + nd
+		poke_i32(spec_tbuf, 0, token)
+		d := 0
+		while d < nd { poke_i32(spec_tbuf, (d+1)*4, peek_i32(draftbuf, d*4))  d = d + 1 }
+		spec_forward(pos, B)
+		spec_steps = spec_steps + 1
+		// verify: spec_argmax[0] is the true token at pos+1
+		a := peek_i32(spec_argmax, 0)
+		emit(piece_text(token, a))
+		gen = gen + 1
+		spec_tokens = spec_tokens + 1
+		accepted := 0
+		while accepted < nd && peek_i32(spec_argmax, accepted*4) == peek_i32(draftbuf, accepted*4) && gen < max_new {
+			na := peek_i32(spec_argmax, (accepted+1)*4)
+			poke_i32(cache_buf, (pos+1+accepted)*4, a)
+			if is_stop_token(na) { accepted = accepted + 1  break }
+			emit(piece_text(a, na))
+			gen = gen + 1
+			spec_tokens = spec_tokens + 1
+			a = na
+			accepted = accepted + 1
+		}
+		// KV valid for positions 0..pos+accepted; `a` at pos+accepted+1 has no KV
+		cache_len = pos + accepted + 1
+		pos = pos + accepted + 1
+		token = a
+	}
+	free(draftbuf)
+	if len(env("COLIBRI_PROF")) > 0 {
+		println("SPEC steps=" + str(spec_steps) + " tokens=" + str(spec_tokens) + " accept/step=" + str(float(spec_tokens)/float(spec_steps)))
+		flush()
+	}
+	return
 }
 
 // generate: prefill prompt toks (reusing cached KV prefix), then decode up to
@@ -967,10 +1097,19 @@ func generate_cb(toks, max_new, temp, topp, emit) (gen) {
 	i = 0
 	while i < np { poke_i32(cache_buf, i*4, toks[i])  i = i + 1 }
 	cache_len = np
-	pos := np
-	token := 0
 	prev := 1
 	if np > 0 { prev = toks[np-1] }
+	// speculative (prompt-lookup) decode: greedy only (verify is argmax), int8,
+	// enabled by COLIBRI_SPEC. Exact — accepted tokens == plain greedy.
+	if spec_enabled == 1 && temp <= 0.0 && quant4 == 0 {
+		token0 := argmax_logits()
+		if is_stop_token(token0) { return }
+		emit(piece_text(prev, token0))
+		gen = 1 + spec_generate(np, token0, max_new - 1, emit)
+		return
+	}
+	pos := np
+	token := 0
 	gen = 0
 	while gen < max_new && pos < seq_len {
 		token = sample_next(temp, topp)
@@ -982,6 +1121,10 @@ func generate_cb(toks, max_new, temp, topp, emit) (gen) {
 		prev = token
 		pos = pos + 1
 		gen = gen + 1
+	}
+	if sparse_probe == 1 && sp_total > 0 {
+		println("SPARSE gate<10%%max: " + str(float(sp_below*100)/float(sp_total)) + "%% of neurons  | output-mass kept by active: " + str(float(sp_massk*100.0)/float(sp_massn)) + "%%")
+		flush()
 	}
 	return
 }

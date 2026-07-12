@@ -2,3 +2,10 @@ models/
 colibri
 colibri.mfl
 *.o
+colibri-serve
+colibri_q4
+colibri_mmap
+colibri_q_dot
+serve.mfl
+colibri_q.mfl
+cc-fast*
