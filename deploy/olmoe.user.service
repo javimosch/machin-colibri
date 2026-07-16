@@ -1,0 +1,14 @@
+[Unit]
+Description=colibri OLMoE — pure-MFL OpenAI server (OLMoE-1B-7B MoE, int8)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/jarancibia/ai/machin-colibri
+Environment=COLIBRI_THREADS=8
+ExecStart=/home/jarancibia/ai/machin-colibri/serve_olmoe /home/jarancibia/ai/machin-colibri/models/olmoe-q8-lm8.bin 8091 /home/jarancibia/ai/machin-colibri/models/olmoe-tok.bin
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
