@@ -45,6 +45,18 @@ memory-bound at the active-param footprint. (Quantizing lm_head to int8 would cu
 ~300 MB/token — a further speed lever traded against logit precision; kept fp32
 here for the token-identical result.)
 
+## Quantization variants (`tools_olmoe_convert.py <hf> <out> <ebits> <lmbits>`)
+| experts | lm_head | .bin size | tokens vs fp32 | tok/s (8 thr, warm) |
+|---|---|---|---|---|
+| int8 | fp32 | 7.96 GB | identical (12/12) | 9.4 |
+| **int4** | fp32 | **4.74 GB** | **identical (12/12)** | 7.4 |
+
+int4 experts **halve the expert footprint and stay token-identical** — but they are
+*slower* on this box (7.4 < 9.4): the same balanced-roofline wall the dense int4
+hit. Halving expert bytes drops below the memory ceiling and exposes the `dot_q4`
+nibble-unpack compute + the unchanged fp32 lm_head traffic. The win is **fitting a
+smaller box** (RAM/disk), not speed — exactly the frontier prediction.
+
 ## Why it matters
 The dense 1B hit a ~20 tok/s wall priced at *total* params. OLMoE delivers
 **7B-class quality at ~1.3B active cost** — 11.5 tok/s on a laptop — and streaming

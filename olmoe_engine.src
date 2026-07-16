@@ -22,8 +22,11 @@ var ISC = 0   // I*D/GS  (scales per expert matrix)
 var blk_attn = 0
 var attn_stride = 0
 var router_layer = 0
-var eblk = 0        // one expert sub-matrix block bytes = I*D + 4*ISC
+var ematb = 0       // expert sub-matrix int bytes (I*D int8, or I*D/2 int4)
+var eblk = 0        // one expert sub-matrix block bytes = ematb + 4*ISC
 var expert_stride = 0
+var ebits = 8       // expert quant bits (8=Q8_0, 4=Q4)
+var lmbits = 32     // lm_head bits (32=fp32, 8=int8)
 // section base byte-offsets (from header)
 var embed_off = 0
 var norms_off = 0
@@ -89,13 +92,19 @@ func load_olmoe(path) {
 	attn_off = peek_i32(mb, 64)
 	router_off = peek_i32(mb, 68)
 	experts_off = peek_i32(mb, 72)
+	ebits = peek_i32(mb, 76)
+	if ebits == 0 { ebits = 8 }
+	lmbits = peek_i32(mb, 80)
+	if lmbits == 0 { lmbits = 32 }
 	HALF = HD / 2
 	DSC = (D * D) / GS
 	ISC = (II * D) / GS
 	blk_attn = D*D + 4*DSC
 	attn_stride = 4 * blk_attn
 	router_layer = E*D + 4*((E*D)/GS)
-	eblk = II*D + 4*ISC
+	ematb = II*D
+	if ebits == 4 { ematb = II*D/2 }
+	eblk = ematb + 4*ISC
 	expert_stride = 3 * eblk
 }
 
@@ -165,10 +174,20 @@ func do_job(j, att) {
 		h := lo
 		while h < hi { attn_head(l, pos, h, att)  h = h + 1 }
 	}
-	if t == 4 {   // down-proj accumulate: moe[o] += gj_w * W[o,:].gbuf(quantized)
+	if t == 4 {   // down-proj accumulate (int8): moe[o] += gj_w * W[o,:].gbuf
 		nsc := gj_n / GS
 		o := lo
 		while o < hi { poke_f32(moe, o*4, peek_f32(moe, o*4) + gj_w * dot_q8(xqb, xsb, gj_wq + o*gj_n, gj_ws + o*nsc*4, gj_n, GS))  o = o + 1 }
+	}
+	if t == 5 {   // int4 matmul: gj_dst[o] = W_int4[o,:].x
+		nsc := gj_n / GS
+		o := lo
+		while o < hi { poke_f32(gj_dst, o*4, dot_q4(xqb, xsb, gj_wq + o*(gj_n/2), gj_ws + o*nsc*4, gj_n, GS))  o = o + 1 }
+	}
+	if t == 6 {   // int4 down-proj accumulate
+		nsc := gj_n / GS
+		o := lo
+		while o < hi { poke_f32(moe, o*4, peek_f32(moe, o*4) + gj_w * dot_q4(xqb, xsb, gj_wq + o*(gj_n/2), gj_ws + o*nsc*4, gj_n, GS))  o = o + 1 }
 	}
 }
 
@@ -204,6 +223,14 @@ func matmul_q8(dst, wq, ws, x, out, inn) {
 	quantize_act(xqb, xsb, x, inn)
 	gj_dst = dst  gj_wq = wq  gj_ws = ws  gj_n = inn
 	dispatch_rows(1, 0, 0, out)
+	barrier()
+}
+
+// expert matmul: dispatches int8 (t=1) or int4 (t=5) per ebits
+func matmul_exp(dst, wq, ws, x, out, inn) {
+	quantize_act(xqb, xsb, x, inn)
+	gj_dst = dst  gj_wq = wq  gj_ws = ws  gj_n = inn
+	if ebits == 4 { dispatch_rows(5, 0, 0, out) } else { dispatch_rows(1, 0, 0, out) }
 	barrier()
 }
 
@@ -301,13 +328,13 @@ func moe_ffn(l) {
 		poke_i32(touched, (l*E + eid)*4, 1)
 		eb := experts_off + (l*E + eid)*expert_stride
 		gq := eb
-		gsx := eb + II*D
+		gsx := eb + ematb
 		uq := eb + eblk
-		usx := eb + eblk + II*D
+		usx := eb + eblk + ematb
 		dq := eb + 2*eblk
-		dsx := eb + 2*eblk + D*II
-		matmul_q8(gbuf, mb + gq, mb + gsx, hh, II, D)   // gate_proj [I,D]
-		matmul_q8(ubuf, mb + uq, mb + usx, hh, II, D)   // up_proj   [I,D]
+		dsx := eb + 2*eblk + ematb
+		matmul_exp(gbuf, mb + gq, mb + gsx, hh, II, D)   // gate_proj [I,D]
+		matmul_exp(ubuf, mb + uq, mb + usx, hh, II, D)   // up_proj   [I,D]
 		i := 0
 		while i < II {
 			g := peek_f32(gbuf, i*4)
@@ -318,7 +345,7 @@ func moe_ffn(l) {
 		// down_proj [D,I] applied to gbuf -> accumulate w*y into moe (parallel)
 		quantize_act(xqb, xsb, gbuf, II)
 		gj_wq = mb + dq  gj_ws = mb + dsx  gj_n = II  gj_w = w
-		dispatch_rows(4, 0, 0, D)
+		if ebits == 4 { dispatch_rows(6, 0, 0, D) } else { dispatch_rows(4, 0, 0, D) }
 		barrier()
 		kk = kk + 1
 	}
@@ -358,9 +385,13 @@ func forward(tok, pos) (best) {
 		l = l + 1
 	}
 	rmsnorm(hh, xx, fnorm_off, D)
-	gj_wf = lmhead_off
-	dispatch_rows(2, 0, 0, VOCAB)   // lm_head fp32 matvec (reads hh)
-	barrier()
+	if lmbits == 8 {
+		matmul_q8(logits, mb + lmhead_off, mb + lmhead_off + VOCAB*D, hh, VOCAB, D)
+	} else {
+		gj_wf = lmhead_off
+		dispatch_rows(2, 0, 0, VOCAB)   // lm_head fp32 matvec (reads hh)
+		barrier()
+	}
 	bi := 0
 	bv := peek_f32(logits, 0)
 	i = 1

@@ -110,10 +110,10 @@ $ COLIBRI_THREADS=8 ./olmoe models/olmoe-q8.bin
   11.5 tok/s · experts streamed in: 622/1024 · token-identical to fp32 reference
 ```
 
-- **Token-identical to the numpy fp32 ground truth** — int8 didn't flip a single token (12/12).
-- **7.96 GB** int8 checkpoint (experts/attn int8, embed/lm_head/norms fp32); warm working set fits a 10 GB box.
+- **Token-identical to the numpy fp32 ground truth** — quantization didn't flip a single token (12/12), at both **int8** (7.96 GB) *and* **int4 experts** (4.74 GB).
 - **11.5 tok/s** on a laptop (8 cores), near the DDR ceiling for the active-param footprint.
-- Same pure-MFL engine, same `dot_q8` kernel, same `mmap_file` streaming.
+- **int4 experts halve the footprint** to 4.74 GB (fits a smaller box) — still token-identical; slightly slower on a compute-balanced CPU (the [balanced-roofline wall](docs/PERFORMANCE-FRONTIER.md)), a footprint win, not a speed one.
+- Same pure-MFL engine, same `dot_q8`/`dot_q4` kernels, same `mmap_file` streaming.
 
 **7B-class quality at ~1B speed, on hardware you own — in a language you'd never heard of.**
 
