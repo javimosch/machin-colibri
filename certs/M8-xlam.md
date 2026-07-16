@@ -50,11 +50,37 @@ model" is met at the model+API level.
 OLMoE's active FFN). Idle-release: 27 MB. Deploy: `deploy/xlam.user.service`
 (user systemd, :8092).
 
-## Known gap for pi (agentic client)
-pi *reaches* the model and it *does* call tools — but pi sends a large agentic
-system prompt (~thousands of tokens) and this engine does **sequential prefill**
-(one forward per prompt token), so a single pi turn is minutes at 11 tok/s. The
-model is pi-capable; the UX needs **batched prefill + a prefix cache** (both exist
-in the dense colibri engine — porting them here is the next step to make pi
-practical). Until then, xLAM is best used via the direct OpenAI API (curl / SDK /
-single-shot clients), where chat and function-calling are fast and correct.
+## Making pi practical: batched prefill + prefix cache (ported 2026-07-13)
+
+pi resends a large agentic system prompt every turn. The engine now has both
+levers the dense engine has:
+
+- **Batched prefill** (`batch_layers`/`prefill_batch`, `COLIBRI_TILE`, off with
+  `COLIBRI_NOBATCH=1`) — a tile of positions runs through each layer together so
+  each weight is read once per tile. **Verified bit-identical to per-token** on
+  coherent input ("…Italy is Rome. The capital of Spain is Madrid").
+- **Single-slot KV prefix cache** (`cache_buf`/`cache_common`) — persists the KV
+  across requests; a repeated prefix is skipped entirely.
+
+### Discovery — measured on this laptop (632-token prompt, 8 threads):
+| | cold prefill | repeated prompt (prefix cache) |
+|---|---|---|
+| per-token | 53.5 s | — |
+| **batched** | **40.9 s** | **0.45 s** |
+
+Two honest findings:
+1. **Batched prefill is only ~1.3× on this box** (53.5→40.9 s), *not* the large
+   speedup one expects. Same **balanced-roofline wall** as everywhere else in
+   this repo: batching trades weight-*reads* for compute (B× the matmul FLOPs),
+   and this CPU is compute-balanced, so the shared weight-read doesn't dominate.
+   Batched prefill is the right lever on a memory-bound box; here it's marginal.
+2. **The prefix cache is the real multi-turn win: ~91×** (40.9 s → 0.45 s) on a
+   repeated prompt. End-to-end through the server with a 40×-repeated system
+   prompt + a tool: **req1 (cold) 20.7 s → req2 (warm) 2.0 s**, both returning the
+   correct `get_weather({"city":"Paris"})`.
+
+**Net for pi:** the first agentic turn pays the cold prefill (~tens of seconds for
+a multi-thousand-token system prompt), but every turn after reuses the cached
+prefix and only prefills the delta — so the loop is practical. The cold first turn
+is a floor set by the hardware (632 tokens × 1.35B params of compute), not the
+engine.

@@ -131,6 +131,18 @@ $ COLIBRI_THREADS=8 ./olmoe models/olmoe-q8-lm8.bin
 
 **7B-class quality at ~1B speed, on hardware you own — in a language you'd never heard of.**
 
+## Also: a function-calling agent model (xLAM-1b-fc-r)
+
+The same engine family runs **[xLAM-1b-fc-r](certs/M8-xlam.md)** — a 1B
+function-calling-specialized model (deepseek/Llama arch) in pure MFL,
+token-identical to fp32, **1.62 GB** on disk. Its OpenAI server does real tool
+calls (`"weather in Tokyo?"` → `get_weather({"city":"Tokyo"})`), with the deepseek
+byte-level BPE tokenizer written in MFL too. **Batched prefill + a single-slot KV
+prefix cache** make multi-turn agentic clients practical: a repeated system prompt
+goes **20.7 s → 2.0 s** (91× on the cache). Honest note: batched prefill itself is
+only ~1.3× on this compute-balanced CPU (the [balanced-roofline wall](docs/PERFORMANCE-FRONTIER.md)
+applies to prefill too) — the prefix cache is what carries the multi-turn win.
+
 ## Related
 
 - **[machin](https://github.com/javimosch/machin)** — the machine-first language this is written in. The int8/int4 kernel builtins (`dot_q8`, `dot_q4`, `dot_f32`, `axpy_f32`, `mmap_file`) were contributed upstream from this project.
