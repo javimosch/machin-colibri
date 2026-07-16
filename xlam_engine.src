@@ -1,0 +1,342 @@
+// Pure-MFL xLAM-1b-fc-r (deepseek-1.3b / dense Llama arch) inference.
+// Dense SwiGLU FFN, standard RMSNorm (no qk-norm), rotate_half RoPE with LINEAR
+// scaling (pos/rscale), theta 1e5, no GQA. int8 Q8_0 matmuls (dot_q8), mmap +
+// worker pool + madvise idle-release, reused from the OLMoE engine.
+
+var mb = 0
+var model_bytes = 0
+var D = 0
+var NH = 0
+var NKV = 0
+var HD = 0
+var II = 0
+var L = 0
+var VOCAB = 0
+var SEQ = 0
+var GS = 0
+var lmbits = 8
+var rscale = 1
+var theta = 100000
+var HALF = 0
+var DSC = 0
+var ISC = 0
+var blk_attn = 0
+var attn_stride = 0
+var gu = 0        // gate/up block bytes
+var ffn_stride = 0
+var embed_off = 0
+var norms_off = 0
+var fnorm_off = 0
+var lmhead_off = 0
+var attn_off = 0
+var ffn_off = 0
+
+var xx = 0
+var hb = 0
+var qb = 0
+var kb = 0
+var vb = 0
+var attn = 0
+var ffn_out = 0
+var gbuf = 0
+var ubuf = 0
+var xqb = 0
+var xsb = 0
+var att = 0
+var logits = 0
+var kcache = 0
+var vcache = 0
+var rinv = 0
+var rcos = 0
+var rsin = 0
+
+var n_workers = 1
+var jobs = make(chan int)
+var done = make(chan int)
+var pending = 0
+var gj_dst = 0
+var gj_wq = 0
+var gj_ws = 0
+var gj_n = 0
+var gj_wf = 0
+
+func load_xlam(path) {
+	m, sz := mmap_file(path)
+	mb = m
+	model_bytes = sz
+	if peek_i32(mb, 0) != 1634419761 { println("bad magic")  flush() }  // 0x616B4431 akD1
+	D = peek_i32(mb, 4)
+	NH = peek_i32(mb, 8)
+	NKV = peek_i32(mb, 12)
+	HD = peek_i32(mb, 16)
+	II = peek_i32(mb, 20)
+	L = peek_i32(mb, 24)
+	VOCAB = peek_i32(mb, 28)
+	SEQ = peek_i32(mb, 32)
+	GS = peek_i32(mb, 36)
+	lmbits = peek_i32(mb, 40)
+	rscale = peek_i32(mb, 44)
+	theta = peek_i32(mb, 48)
+	embed_off = peek_i32(mb, 52)
+	norms_off = peek_i32(mb, 56)
+	fnorm_off = peek_i32(mb, 60)
+	lmhead_off = peek_i32(mb, 64)
+	attn_off = peek_i32(mb, 68)
+	ffn_off = peek_i32(mb, 72)
+	HALF = HD / 2
+	DSC = (D * D) / GS
+	ISC = (II * D) / GS
+	blk_attn = D*D + 4*DSC
+	attn_stride = 4 * blk_attn
+	gu = II*D + 4*ISC
+	ffn_stride = 3 * gu
+}
+
+func alloc_xlam() {
+	xx = alloc(D*4)  hb = alloc(D*4)  qb = alloc(D*4)  kb = alloc(D*4)  vb = alloc(D*4)
+	attn = alloc(D*4)  ffn_out = alloc(D*4)
+	gbuf = alloc(II*4)  ubuf = alloc(II*4)
+	mx := D
+	if II > D { mx = II }               // quant scratch must cover the widest matmul input (down_proj: II)
+	xqb = alloc(mx)  xsb = alloc((mx/GS)*4)
+	att = alloc(SEQ*4)  logits = alloc(VOCAB*4)
+	kcache = alloc(L*SEQ*D*4)  vcache = alloc(L*SEQ*D*4)
+	rinv = alloc(HALF*4)  rcos = alloc(HALF*4)  rsin = alloc(HALF*4)
+	lnth := 11.512925464970229   // ln(100000); model theta is fixed at 1e5
+	i := 0
+	while i < HALF {
+		poke_f32(rinv, i*4, exp(0.0 - (float(i)/float(HALF)) * lnth))
+		i = i + 1
+	}
+}
+
+func rmsnorm(dst, src, woff, n) {
+	ss := 0.0
+	i := 0
+	while i < n { v := peek_f32(src, i*4)  ss = ss + v*v  i = i + 1 }
+	ss = 1.0 / sqrt(ss/float(n) + 0.000001)
+	i = 0
+	while i < n { poke_f32(dst, i*4, peek_f32(src, i*4) * ss * peek_f32(mb, woff + i*4))  i = i + 1 }
+}
+
+func quantize_act(xq, xs, x, n) {
+	ng := n / GS
+	g := 0
+	while g < ng {
+		base := g * GS
+		wmax := 0.0
+		i := 0
+		while i < GS { v := abs(peek_f32(x, (base+i)*4))  if v > wmax { wmax = v }  i = i + 1 }
+		scale := wmax / 127.0
+		poke_f32(xs, g*4, scale)
+		i = 0
+		while i < GS {
+			q := 0
+			if scale > 0.0 { q = int(round(peek_f32(x, (base+i)*4) / scale)) }
+			poke_u8(xq, base+i, q & 255)
+			i = i + 1
+		}
+		g = g + 1
+	}
+}
+
+func do_job(j, att2) {
+	t := j & 31
+	l := (j >> 5) & 255
+	pos := (j >> 13) & 4095
+	lo := (j >> 25) & 524287
+	hi := j >> 44
+	if t == 1 {
+		nsc := gj_n / GS
+		o := lo
+		while o < hi { poke_f32(gj_dst, o*4, dot_q8(xqb, xsb, gj_wq + o*gj_n, gj_ws + o*nsc*4, gj_n, GS))  o = o + 1 }
+	}
+	if t == 2 {
+		o := lo
+		while o < hi { poke_f32(logits, o*4, dot_f32(mb + gj_wf + o*D*4, hb, D))  o = o + 1 }
+	}
+	if t == 3 {
+		h := lo
+		while h < hi { attn_head(l, pos, h, att2)  h = h + 1 }
+	}
+}
+
+func worker(jc, dc) {
+	att2 := alloc(SEQ * 4)
+	for j := range jc {
+		do_job(j, att2)
+		dc <- 1
+	}
+}
+
+func dispatch_rows(t, l, pos, d) {
+	nc := n_workers
+	if nc > d { nc = d }
+	chunk := (d + nc - 1) / nc
+	lo := 0
+	while lo < d {
+		hi := lo + chunk
+		if hi > d { hi = d }
+		if pending >= n_workers { <-done  pending = pending - 1 }
+		jobs <- (t | l << 5 | pos << 13 | lo << 25 | hi << 44)
+		pending = pending + 1
+		lo = hi
+	}
+}
+
+func barrier() {
+	while pending > 0 { <-done  pending = pending - 1 }
+}
+
+func matmul_q8(dst, wq, ws, x, out, inn) {
+	quantize_act(xqb, xsb, x, inn)
+	gj_dst = dst  gj_wq = wq  gj_ws = ws  gj_n = inn
+	dispatch_rows(1, 0, 0, out)
+	barrier()
+}
+
+func attn_head(l, pos, h, att2) {
+	loff := l * SEQ * D
+	qh := qb + h*HD*4
+	t := 0
+	while t <= pos {
+		kt := kcache + (loff + t*D + h*HD)*4
+		poke_f32(att2, t*4, dot_f32(qh, kt, HD) / sqrt(float(HD)))
+		t = t + 1
+	}
+	softmax(att2, pos+1)
+	ah := attn + h*HD*4
+	j := 0
+	while j < HD { poke_f32(ah, j*4, 0.0)  j = j + 1 }
+	t = 0
+	while t <= pos {
+		vt := vcache + (loff + t*D + h*HD)*4
+		axpy_f32(ah, peek_f32(att2, t*4), vt, HD)
+		t = t + 1
+	}
+}
+
+func attention(l, pos) {
+	loff := l * SEQ * D
+	kc := kcache + (loff + pos*D)*4
+	vc := vcache + (loff + pos*D)*4
+	i := 0
+	while i < D { poke_f32(kc, i*4, peek_f32(kb, i*4))  poke_f32(vc, i*4, peek_f32(vb, i*4))  i = i + 1 }
+	dispatch_rows(3, l, pos, NH)
+	barrier()
+}
+
+func rope(vec) {
+	h := 0
+	while h < NH {
+		b := h * HD
+		i := 0
+		while i < HALF {
+			c := peek_f32(rcos, i*4)
+			s := peek_f32(rsin, i*4)
+			a := peek_f32(vec, (b+i)*4)
+			bb := peek_f32(vec, (b+i+HALF)*4)
+			poke_f32(vec, (b+i)*4, a*c - bb*s)
+			poke_f32(vec, (b+i+HALF)*4, bb*c + a*s)
+			i = i + 1
+		}
+		h = h + 1
+	}
+}
+
+func softmax(p, n) {
+	mx := peek_f32(p, 0)
+	i := 1
+	while i < n { v := peek_f32(p, i*4)  if v > mx { mx = v }  i = i + 1 }
+	sm := 0.0
+	i = 0
+	while i < n { e := exp(peek_f32(p, i*4) - mx)  poke_f32(p, i*4, e)  sm = sm + e  i = i + 1 }
+	i = 0
+	while i < n { poke_f32(p, i*4, peek_f32(p, i*4) / sm)  i = i + 1 }
+}
+
+func ffn(l) {
+	fb := ffn_off + l*ffn_stride
+	matmul_q8(gbuf, mb + fb, mb + fb + II*D, hb, II, D)                 // gate_proj
+	matmul_q8(ubuf, mb + fb + gu, mb + fb + gu + II*D, hb, II, D)       // up_proj
+	i := 0
+	while i < II {
+		g := peek_f32(gbuf, i*4)
+		g = g / (1.0 + exp(0.0 - g))
+		poke_f32(gbuf, i*4, g * peek_f32(ubuf, i*4))
+		i = i + 1
+	}
+	matmul_q8(ffn_out, mb + fb + 2*gu, mb + fb + 2*gu + D*II, gbuf, D, II)  // down_proj
+}
+
+func forward(tok, pos) (best) {
+	sp := float(pos) / float(rscale)
+	i := 0
+	while i < HALF {
+		ang := sp * peek_f32(rinv, i*4)
+		poke_f32(rcos, i*4, cos(ang))
+		poke_f32(rsin, i*4, sin(ang))
+		i = i + 1
+	}
+	i = 0
+	while i < D { poke_f32(xx, i*4, peek_f32(mb, embed_off + (tok*D + i)*4))  i = i + 1 }
+	l := 0
+	while l < L {
+		nb := norms_off + l*(2*D*4)
+		rmsnorm(hb, xx, nb, D)
+		ab := attn_off + l*attn_stride
+		matmul_q8(qb, mb + ab, mb + ab + D*D, hb, D, D)
+		matmul_q8(kb, mb + ab + blk_attn, mb + ab + blk_attn + D*D, hb, D, D)
+		matmul_q8(vb, mb + ab + 2*blk_attn, mb + ab + 2*blk_attn + D*D, hb, D, D)
+		rope(qb)  rope(kb)
+		attention(l, pos)
+		matmul_q8(hb, mb + ab + 3*blk_attn, mb + ab + 3*blk_attn + D*D, attn, D, D)
+		i = 0
+		while i < D { poke_f32(xx, i*4, peek_f32(xx, i*4) + peek_f32(hb, i*4))  i = i + 1 }
+		rmsnorm(hb, xx, nb + D*4, D)
+		ffn(l)
+		i = 0
+		while i < D { poke_f32(xx, i*4, peek_f32(xx, i*4) + peek_f32(ffn_out, i*4))  i = i + 1 }
+		l = l + 1
+	}
+	rmsnorm(hb, xx, fnorm_off, D)
+	if lmbits == 8 {
+		matmul_q8(logits, mb + lmhead_off, mb + lmhead_off + VOCAB*D, hb, VOCAB, D)
+	} else {
+		gj_wf = lmhead_off
+		dispatch_rows(2, 0, 0, VOCAB)
+		barrier()
+	}
+	bi := 0
+	bv := peek_f32(logits, 0)
+	i = 1
+	while i < VOCAB { v := peek_f32(logits, i*4)  if v > bv { bv = v  bi = i }  i = i + 1 }
+	return bi
+}
+
+func xlam_init(path) {
+	load_xlam(path)
+	alloc_xlam()
+	nw := parse_int(env("COLIBRI_THREADS"))
+	if nw > 0 { n_workers = nw } else { n_workers = 6 }
+	w := 0
+	while w < n_workers { go worker(jobs, done)  w = w + 1 }
+}
+
+// greedy from a fresh sequence; stop at eos(32021) or max_new
+func gen_ids(prompt, np, max_new) (out) {
+	out = []int{}
+	pos := 0
+	i := 0
+	while i < np - 1 && pos < SEQ - 1 { forward(prompt[i], pos)  pos = pos + 1  i = i + 1 }
+	cur := prompt[np-1]
+	i = 0
+	while i < max_new && pos < SEQ - 1 {
+		cur = forward(cur, pos)
+		pos = pos + 1
+		if cur == 32021 { break }
+		out = append(out, cur)
+		i = i + 1
+	}
+	return
+}

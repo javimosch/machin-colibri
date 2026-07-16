@@ -20,3 +20,8 @@ serve_olmoe.mfl
 serve_olmoe
 olmoe_cli
 __pycache__/
+xlam.mfl
+xlam_cli
+serve_xlam.mfl
+serve_xlam
+xlam-hf/

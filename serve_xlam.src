@@ -1,0 +1,200 @@
+// xLAM-1b-fc-r OpenAI-compatible server in pure MFL — deepseek chat template
+// (### Instruction / ### Response) + prompt-based function calling for agentic
+// clients (pi). Build: machin encode framework/machweb.src xlam_engine.src
+// xlam_tok.src serve_xlam.src > serve_xlam.mfl
+
+var model_id = "xlam-1b-fc-r"
+var mu_acq = make(chan int)
+var mu_rel = make(chan int)
+var last_req = 0
+var released = 0
+var idle_ms = 300000
+
+func mutex_srv(acq, rel) {
+	while true {
+		acq <- 1
+		v := <-rel
+		if v < 0 { break }
+	}
+}
+
+func idle_watchdog() {
+	while true {
+		sleep(30000)
+		if idle_ms > 0 && released == 0 && now_ms() - last_req > idle_ms {
+			g := <-mu_acq
+			if released == 0 && now_ms() - last_req > idle_ms {
+				madvise_free(mb, model_bytes)
+				released = 1
+				println("[colibri] idle -> released model pages")
+				flush()
+			}
+			mu_rel <- 1
+		}
+	}
+}
+
+func json_esc(s) (o) {
+	o = replace(s, "\\", "\\\\")
+	o = replace(o, "\"", "\\\"")
+	o = replace(o, "\n", "\\n")
+	o = replace(o, "\r", "\\r")
+	o = replace(o, "\t", "\\t")
+	return
+}
+
+func json_str(s) (o) {
+	v := s
+	if len(v) >= 2 && has_prefix(v, "\"") && has_suffix(v, "\"") { v = substr(v, 1, len(v)-1) }
+	o = ""
+	b := bytes(v)
+	n := len(b)
+	i := 0
+	while i < n {
+		c := byte_at(b, i)
+		if c == 92 && i+1 < n {
+			d := byte_at(b, i+1)
+			if d == 110 { o = o + "\n"  i = i + 2  continue }
+			if d == 116 { o = o + "\t"  i = i + 2  continue }
+			if d == 114 { o = o + "\r"  i = i + 2  continue }
+			if d == 34 { o = o + "\""  i = i + 2  continue }
+			if d == 92 { o = o + "\\"  i = i + 2  continue }
+			if d == 47 { o = o + "/"  i = i + 2  continue }
+		}
+		o = o + bytes_str(bytes_sub(b, i, i+1))
+		i = i + 1
+	}
+	return
+}
+
+// build the deepseek/xLAM prompt from OpenAI messages (+ tools if present)
+func build_prompt(body) (text) {
+	sys := "You are an AI assistant for function calling.For politically sensitive questions, security and privacy issues, and other non-computer science questions, you will refuse to answer\n"
+	r0, e0 := json_get(body, ".messages[0].role")
+	if len(e0) == 0 && json_str(r0) == "system" {
+		c0, _ := json_get(body, ".messages[0].content")
+		sys = json_str(c0)
+	}
+	// tools -> inject their JSON so the model can emit calls
+	tools := ""
+	ti := 0
+	while ti < 32 {
+		fn, et := json_get(body, ".tools[" + str(ti) + "].function")
+		if len(et) > 0 { break }
+		tools = tools + fn
+		if ti > 0 { tools = "," + tools }
+		ti = ti + 1
+	}
+	text := sys
+	if len(tools) > 0 {
+		text = text + "\nYou have access to these functions. To call one, respond ONLY with JSON: [{\"name\": <fn>, \"arguments\": <args>}].\nFunctions: [" + tools + "]\n"
+	}
+	i := 0
+	first := 0
+	if len(e0) == 0 && json_str(r0) == "system" { first = 1 }
+	i = first
+	while i < 256 {
+		role, er := json_get(body, ".messages[" + str(i) + "].role")
+		if len(er) > 0 { break }
+		content, _ := json_get(body, ".messages[" + str(i) + "].content")
+		rr := json_str(role)
+		cc := json_str(content)
+		if rr == "user" { text = text + "### Instruction:\n" + cc + "\n### Response:" }
+		if rr == "assistant" { text = text + "\n" + cc + "\n<|EOT|>\n" }
+		if rr == "tool" { text = text + "### Instruction:\nTool result: " + cc + "\n### Response:" }
+		i = i + 1
+	}
+	return text
+}
+
+// find a JSON object/array with a "name" key in the model output (tool call)
+func find_tool_call(s) (found, name, argsj) {
+	found = 0  name = ""  argsj = "{}"
+	ni := index(s, "\"name\"")
+	if ni < 0 { return }
+	// name value
+	rest := substr(s, ni+6, len(s))
+	q1 := index(rest, "\"")
+	if q1 < 0 { return }
+	after := substr(rest, q1+1, len(rest))
+	q2 := index(after, "\"")
+	if q2 < 0 { return }
+	name = substr(after, 0, q2)
+	// arguments object
+	ai := index(s, "\"arguments\"")
+	if ai >= 0 {
+		ar := substr(s, ai+11, len(s))
+		ob := index(ar, "{")
+		if ob >= 0 {
+			depth := 0
+			j := ob
+			b := bytes(ar)
+			while j < len(ar) {
+				c := byte_at(b, j)
+				if c == 123 { depth = depth + 1 }
+				if c == 125 { depth = depth - 1  if depth == 0 { argsj = substr(ar, ob, j+1)  break } }
+				j = j + 1
+			}
+		}
+	}
+	found = 1
+	return
+}
+
+func handle_chat(reqbody) (res) {
+	text := build_prompt(reqbody)
+	max_new := 256
+	mn, me := json_get(reqbody, ".max_tokens")
+	if len(me) == 0 { v := parse_int(mn)  if v > 0 { max_new = v } }
+	ids := tok_encode(text)
+	last_req = now_ms()
+	released = 0
+	g := <-mu_acq
+	out := gen_ids(ids, len(ids), max_new)
+	g = g
+	mu_rel <- 1
+	last_req = now_ms()
+	reply := tok_decode(out)
+	np := len(ids)
+	n := len(out)
+	found, tname, targs := find_tool_call(reply)
+	if found == 1 {
+		callid := "call_" + str(np) + str(n)
+		tc := "{\"index\":0,\"id\":\"" + callid + "\",\"type\":\"function\",\"function\":{\"name\":\"" + json_esc(tname) + "\",\"arguments\":\"" + json_esc(targs) + "\"}}"
+		body := "{\"id\":\"chatcmpl-xlam\",\"object\":\"chat.completion\",\"created\":0,\"model\":\"" + model_id + "\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[" + tc + "]},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":" + str(np) + ",\"completion_tokens\":" + str(n) + ",\"total_tokens\":" + str(np+n) + "}}"
+		res = ok_json(body)
+		return
+	}
+	body := "{\"id\":\"chatcmpl-xlam\",\"object\":\"chat.completion\",\"created\":0,\"model\":\"" + model_id + "\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"" + json_esc(reply) + "\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":" + str(np) + ",\"completion_tokens\":" + str(n) + ",\"total_tokens\":" + str(np+n) + "}}"
+	res = ok_json(body)
+	return
+}
+
+func api_route(req) (res) {
+	if req.method == "POST" && req.path == "/v1/chat/completions" { res = handle_chat(req.body)  return }
+	if req.method == "GET" && req.path == "/v1/models" { res = ok_json("{\"object\":\"list\",\"data\":[{\"id\":\"" + model_id + "\",\"object\":\"model\",\"owned_by\":\"colibri\"}]}")  return }
+	if req.method == "GET" && req.path == "/health" { res = ok_json("{\"ok\":true,\"model\":\"" + model_id + "\"}")  return }
+	res = ok_json("{\"error\":{\"message\":\"not found\",\"type\":\"invalid_request_error\"}}")
+	return
+}
+
+func main() {
+	a := args()
+	path := "models/xlam-q8.bin"
+	port := 8092
+	tokf := "models/xlam-tok.bin"
+	if len(a) > 1 { path = a[1] }
+	if len(a) > 2 { port = parse_int(a[2]) }
+	if len(a) > 3 { tokf = a[3] }
+	t0 := now_ms()
+	xlam_init(path)
+	load_tok(tokf)
+	is := parse_int(env("COLIBRI_IDLE"))
+	if len(env("COLIBRI_IDLE")) > 0 { idle_ms = is * 1000 }
+	last_req = now_ms()
+	go mutex_srv(mu_acq, mu_rel)
+	go idle_watchdog()
+	println("xlam serve: " + model_id + " layers=" + str(L) + " loaded in " + str(now_ms()-t0) + " ms, " + str(n_workers) + " workers, idle-release " + str(idle_ms/1000) + "s")
+	println("OpenAI-compatible API on http://0.0.0.0:" + str(port) + "/v1")
+	serve(port, func(req) { return api_route(req) })
+}

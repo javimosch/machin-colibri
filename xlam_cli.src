@@ -1,0 +1,17 @@
+func main() {
+	a := args()
+	path := "models/xlam-q8.bin"
+	if len(a) > 1 { path = a[1] }
+	xlam_init(path)
+	println("xLAM loaded: D=" + str(D) + " layers=" + str(L) + " inter=" + str(II) + " vocab=" + str(VOCAB) + " lm_head " + str(lmbits) + " | " + str(n_workers) + " workers")
+	flush()
+	prompt := []int{32013, 546, 6075, 280, 7243, 317}   // "<bos>The capital of France is"
+	t0 := now_ms()
+	ids := gen_ids(prompt, len(prompt), 12)
+	t1 := now_ms()
+	out := ""
+	i := 0
+	while i < len(ids) { out = out + str(ids[i])  if i < len(ids)-1 { out = out + ", " }  i = i + 1 }
+	println("MFL gen: [" + out + "]")
+	println("tok/s: " + str(float((len(prompt)-1+len(ids))*1000)/float(t1-t0)))
+}
