@@ -146,6 +146,38 @@ levers that remain all change the *model*, not the code:
 The engine's job — get to the roofline in pure MFL — is done. Everything past
 here is a quantization or model-architecture choice.
 
+## The escape hatch: MoE + expert streaming (the original colibrì's insight)
+
+Studying [JustVugg/colibri](https://github.com/JustVugg/colibri)'s code (the
+project this one is named after) closes the loop on "the disruption is in the
+model." Their engine runs a **744B-parameter MoE on 25 GB of RAM** by keeping
+the dense weights resident and **streaming the 19,456 routed experts from NVMe
+on demand** (per-layer LRU + pinned hot-store + the OS page cache as a free L2;
+`COLI_MMAP=1` mode is literally mmap views into the safetensors).
+
+Why this beats our wall, in our own terms:
+
+- The balanced-roofline wall prices a token at **active** parameters (bytes
+  moved × compute). A dense model's active = total, so quality is capped by the
+  wall. **MoE decouples them**: OLMoE-1B-7B has 7B total / **1.3B active** —
+  7B-class quality at the ~1B-dense cost we've already proven (~20 tok/s here).
+- Streaming works *only* because of routing: a dense model larger than RAM
+  thrashes (every weight touched every token), an MoE touches top-k experts per
+  layer per token, so the hot set stays in page cache and cold experts fault in
+  from NVMe. **Total model size becomes bounded by SSD, not RAM.**
+- We already shipped the enabler: `mmap_file`. The OS page cache is the LRU.
+  The kernels (`dot_q8`/`dot_q4`) price each expert's three small matmuls.
+- Their MTP speculation gets **39–59% draft acceptance** (2.2–2.8 tok/forward)
+  where our prompt-lookup got +10% — because GLM ships a *trained* MTP head.
+  Same lesson a third time: speculation pays when the model provides the draft.
+
+Concretely for this repo (the proposed M7): **OLMoE-1B-7B-Instruct** — the same
+model the original colibrì used to validate its core ("Stage A", `c/olmoe.c`).
+int8 experts ≈ 7 GB (int4 ≈ 3.5 GB) against rbm21's 10 GB RAM: the hot experts
+live in page cache, the router picks 8 of 64 per layer, and the active set is
+1.3B — our proven speed regime. Headline if it works: **a 7B-class model on a
+10 GB box at the speed of a 1B, in pure MFL.**
+
 ## Reproduce
 
 All flags live on `colibri-serve`: `COLIBRI_NOBATCH=1` (per-token prefill A/B),
