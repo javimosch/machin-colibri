@@ -131,6 +131,17 @@ $ COLIBRI_THREADS=8 ./olmoe models/olmoe-q8-lm8.bin
 
 **7B-class quality at ~1B speed, on hardware you own — in a language you'd never heard of.**
 
+## Also: a 32k-context instruct model (Qwen2.5-1.5B) with streaming
+
+**[Qwen2.5-1.5B-Instruct](certs/M9-qwen.md)** runs in pure MFL at **32k context** —
+token-identical to fp32, **1.64 GB** int8. It adds **GQA** (which is what makes 32k
+fit a 16 GB laptop: the KV cache is 1.9 GB at full context vs 12.9 GB without),
+**QKV bias**, and **tied embeddings**. Its server does **real SSE streaming** +
+ChatML + function-calling — so agentic clients that require streaming work.
+Discovery: on a 152k-token vocab, the tied **fp32** lm_head cost 933 MB/token
+(decode 3.6 tok/s); quantizing it to int8 → **7.8 tok/s** (2.2×), still
+token-identical.
+
 ## Also: a function-calling agent model (xLAM-1b-fc-r)
 
 The same engine family runs **[xLAM-1b-fc-r](certs/M8-xlam.md)** — a 1B

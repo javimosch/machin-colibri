@@ -25,3 +25,8 @@ xlam_cli
 serve_xlam.mfl
 serve_xlam
 xlam-hf/
+qwen.mfl
+qwen_cli
+serve_qwen.mfl
+serve_qwen
+qwen-hf/

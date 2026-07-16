@@ -1,0 +1,222 @@
+// Pure-MFL xLAM/deepseek tokenizer: byte-level BPE with the deepseek
+// pretokenizer (letters / punct / individual-digits / newlines). Composes with
+// xlam_engine.src. Validated encode("The capital of France is")==[546,6075,280,
+// 7243,317] (BOS 32013 prepended by tok_encode).
+
+var tok_vocab = []string{}
+var tok_idx = make(map[string]int)
+var mrank = make(map[string]int)
+var byte2str = []string{}
+var cp2byte = make(map[int]int)
+var rawbyte = []string{}
+
+func read_i32(b, off) (v) {
+	v = byte_at(b, off) | byte_at(b, off+1) << 8 | byte_at(b, off+2) << 16 | byte_at(b, off+3) << 24
+	if v >= 2147483648 { v = v - 4294967296 }
+	return
+}
+
+func cp_at(b, i) (cp, n) {
+	c := byte_at(b, i)
+	cp = c
+	n = 1
+	if c < 128 { return }
+	if (c & 224) == 192 { cp = (c & 31) << 6 | (byte_at(b, i+1) & 63)  n = 2  return }
+	if (c & 240) == 224 { cp = (c & 15) << 12 | (byte_at(b, i+1) & 63) << 6 | (byte_at(b, i+2) & 63)  n = 3  return }
+	cp = (c & 7) << 18 | (byte_at(b, i+1) & 63) << 12 | (byte_at(b, i+2) & 63) << 6 | (byte_at(b, i+3) & 63)
+	n = 4
+	return
+}
+
+func is_letter(cp) (r) {
+	r = false
+	if cp >= 65 && cp <= 90 { r = true  return }
+	if cp >= 97 && cp <= 122 { r = true  return }
+	if cp >= 192 && cp <= 591 && cp != 215 && cp != 247 { r = true  return }
+	if cp >= 880 && cp <= 1023 { r = true  return }
+	if cp >= 1024 && cp <= 1279 { r = true  return }
+	if cp >= 12352 && cp <= 12543 { r = true  return }
+	if cp >= 19968 && cp <= 40959 { r = true  return }
+	if cp >= 44032 && cp <= 55215 { r = true  return }
+	return
+}
+
+func is_digit_cp(cp) (r) { r = false  if cp >= 48 && cp <= 57 { r = true }  return }
+func is_space_cp(cp) (r) { r = false  if cp == 32 || cp == 9 || cp == 10 || cp == 13 || cp == 12 || cp == 11 || cp == 160 { r = true }  return }
+
+// ASCII punctuation (\p{P}); covers code/JSON/English inputs incl '_'
+func is_punct(cp) (r) {
+	r = false
+	if cp >= 33 && cp <= 47 { r = true  return }
+	if cp >= 58 && cp <= 64 { r = true  return }
+	if cp >= 91 && cp <= 96 { r = true  return }
+	if cp >= 123 && cp <= 126 { r = true  return }
+	return
+}
+
+func load_tok(path) {
+	b := read_file_bytes(path)
+	if len(b) == 0 { println("cannot read tokenizer: " + path)  exit(1) }
+	nv := read_i32(b, 4)
+	nm := read_i32(b, 8)
+	off := 12
+	v := []string{}
+	i := 0
+	while i < nv {
+		l := read_i32(b, off)  off = off + 4
+		s := bytes_str(bytes_sub(b, off, off+l))  off = off + l
+		v = append(v, s)
+		if len(s) > 0 { tok_idx[s] = i }
+		i = i + 1
+	}
+	tok_vocab = v
+	i = 0
+	while i < nm {
+		l := read_i32(b, off)  off = off + 4
+		s := bytes_str(bytes_sub(b, off, off+l))  off = off + l
+		mrank[s] = i
+		i = i + 1
+	}
+	bs := []string{}
+	i = 0
+	while i < 256 {
+		l := read_i32(b, off)  off = off + 4
+		s := bytes_str(bytes_sub(b, off, off+l))  off = off + l
+		bs = append(bs, s)
+		cb := bytes(s)
+		cp, _ := cp_at(cb, 0)
+		cp2byte[cp] = i
+		i = i + 1
+	}
+	byte2str = bs
+	rb := []string{}
+	i = 0
+	while i < 256 { rb = append(rb, bytes_str(bytes_sub(b, off+i, off+i+1)))  i = i + 1 }
+	rawbyte = rb
+}
+
+func contraction_len(b, i, n) (l) {
+	l = 0
+	if byte_at(b, i) != 39 { return }
+	if i + 1 >= n { return }
+	c1 := byte_at(b, i+1) | 32
+	if c1 == 115 || c1 == 116 || c1 == 109 || c1 == 100 { l = 2  return }
+	if i + 2 < n {
+		c2 := byte_at(b, i+2) | 32
+		if (c1 == 114 && c2 == 101) || (c1 == 118 && c2 == 101) || (c1 == 108 && c2 == 108) { l = 3  return }
+	}
+	return
+}
+
+// llama3/Qwen pretokenizer: contraction | ?letters | single-digit | ?punct+nl | whitespace
+func l3_pretok(text) (parts) {
+	parts = []string{}
+	b := bytes(text)
+	n := len(b)
+	i := 0
+	while i < n {
+		cl := contraction_len(b, i, n)
+		if cl > 0 { parts = append(parts, bytes_str(bytes_sub(b, i, i+cl)))  i = i + cl  continue }
+		cp, w := cp_at(b, i)
+		j := i
+		pfx := 0
+		if is_letter(cp) == false && is_digit_cp(cp) == false && cp != 10 && cp != 13 { j = i + w  pfx = 1 }
+		if j < n {
+			c2, w2 := cp_at(b, j)
+			if is_letter(c2) {
+				k := j
+				while k < n { c3, w3 := cp_at(b, k)  if is_letter(c3) == false { break }  k = k + w3 }
+				parts = append(parts, bytes_str(bytes_sub(b, i, k)))  i = k  continue
+			}
+		}
+		if pfx == 1 { j = i }
+		if is_digit_cp(cp) { parts = append(parts, bytes_str(bytes_sub(b, i, i+w)))  i = i + w  continue }
+		j = i
+		if cp == 32 { j = i + 1 }
+		if j < n {
+			c2, w2 := cp_at(b, j)
+			if is_space_cp(c2) == false && is_letter(c2) == false && is_digit_cp(c2) == false {
+				k := j
+				while k < n { c3, w3 := cp_at(b, k)  if is_space_cp(c3) || is_letter(c3) || is_digit_cp(c3) { break }  k = k + w3 }
+				while k < n && (byte_at(b, k) == 10 || byte_at(b, k) == 13) { k = k + 1 }
+				parts = append(parts, bytes_str(bytes_sub(b, i, k)))  i = k  continue
+			}
+		}
+		if is_space_cp(cp) {
+			k := i
+			has_nl := 0
+			last_nl_end := i
+			while k < n { c3, w3 := cp_at(b, k)  if is_space_cp(c3) == false { break }  k = k + w3  if c3 == 10 || c3 == 13 { has_nl = 1  last_nl_end = k } }
+			if has_nl == 1 && last_nl_end > i { parts = append(parts, bytes_str(bytes_sub(b, i, last_nl_end)))  i = last_nl_end  continue }
+			if k < n && k - i > 1 { parts = append(parts, bytes_str(bytes_sub(b, i, k-1)))  i = k - 1  continue }
+			parts = append(parts, bytes_str(bytes_sub(b, i, k)))  i = k  continue
+		}
+		parts = append(parts, bytes_str(bytes_sub(b, i, i+w)))  i = i + w
+	}
+	return
+}
+
+func bpe_piece(part) (ids) {
+	ids = []int{}
+	pb := bytes(part)
+	syms := []string{}
+	i := 0
+	while i < len(pb) { syms = append(syms, byte2str[byte_at(pb, i)])  i = i + 1 }
+	while len(syms) > 1 {
+		best := 0 - 1
+		bestrank := 999999999
+		i = 0
+		while i < len(syms) - 1 {
+			key := syms[i] + " " + syms[i+1]
+			if has(mrank, key) {
+				r := mrank[key]
+				if r < bestrank { bestrank = r  best = i }
+			}
+			i = i + 1
+		}
+		if best < 0 { break }
+		ns := []string{}
+		i = 0
+		while i < len(syms) {
+			if i == best { ns = append(ns, syms[i] + syms[i+1])  i = i + 2 } else { ns = append(ns, syms[i])  i = i + 1 }
+		}
+		syms = ns
+	}
+	i = 0
+	while i < len(syms) { if has(tok_idx, syms[i]) { ids = append(ids, tok_idx[syms[i]]) }  i = i + 1 }
+	return
+}
+
+// encode text -> BPE ids (no special tokens; server inserts ChatML specials)
+func tok_encode_raw(text) (ids) {
+	ids = []int{}
+	parts := l3_pretok(text)
+	i := 0
+	while i < len(parts) {
+		sub := bpe_piece(parts[i])
+		j := 0
+		while j < len(sub) { ids = append(ids, sub[j])  j = j + 1 }
+		i = i + 1
+	}
+	return
+}
+
+// decode ids -> text; byte-level tokens (<32000) map back to bytes, specials skipped
+func tok_decode(ids) (out) {
+	out = ""
+	i := 0
+	while i < len(ids) {
+		id := ids[i]
+		if id >= 0 && id < 151643 && id < len(tok_vocab) {
+			sb := bytes(tok_vocab[id])
+			p := 0
+			while p < len(sb) {
+				cp, w := cp_at(sb, p)
+				if has(cp2byte, cp) { out = out + rawbyte[cp2byte[cp]] }
+				p = p + w
+			}
+		}
+		i = i + 1
+	}
+	return
+}
