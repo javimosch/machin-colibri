@@ -1,0 +1,271 @@
+// Pure-MFL MoE spike: proves router -> top-k -> SwiGLU experts -> weighted sum,
+// with experts STREAMED via mmap (the OS page cache is the per-layer LRU; cold
+// experts are never faulted in). Verified token-identical to the numpy
+// reference (tools_gen_moe_spike.py). fp32 throughout — correctness first;
+// quantization is orthogonal and already proven in the dense engine.
+
+var mb = 0          // mmap base (byte address of the model file)
+var D = 0
+var NH = 0
+var NKV = 0
+var HD = 0
+var II = 0          // intermediate_size
+var E = 0           // n_experts
+var K = 0           // top-k
+var L = 0           // n_layers
+var VOCAB = 0
+var SEQ = 0
+var NORM_TOPK = 0
+var KV = 0          // NKV*HD
+var HDR = 48        // header bytes: 12 * int32
+
+// float-offsets (in floats, from the first float after the header)
+var off_embed = 0
+var layer_stride = 0
+var off_layers = 0
+var off_fnorm = 0
+var off_lmhead = 0
+var experts_base = 0
+var expert_stride = 0
+
+// scratch (alloc'd)
+var xb = 0     // D   residual
+var hb = 0     // D   normed
+var qb = 0     // D
+var kb = 0     // KV
+var vb = 0     // KV
+var att = 0    // SEQ scores
+var attn = 0   // D
+var gbuf = 0   // II
+var ubuf = 0   // II
+var mo = 0     // D moe out
+var logits = 0 // max(E,VOCAB)
+var kcache = 0 // L*SEQ*KV floats
+var vcache = 0
+var touched = 0 // E*L flags: which experts were read (streaming proof)
+
+func gfp(foff) (p) { return mb + HDR + foff*4 }     // byte ptr to float at float-offset foff
+func gf(foff) (v) { return peek_f32(mb, HDR + foff*4) }
+
+func load_moe(path) {
+	m, _ := mmap_file(path)
+	mb = m
+	if peek_i32(mb, 0) != 1299137841 { println("bad magic")  flush() }  // 0x4D6F4531 "MoE1"
+	D = peek_i32(mb, 4)
+	NH = peek_i32(mb, 8)
+	NKV = peek_i32(mb, 12)
+	HD = peek_i32(mb, 16)
+	II = peek_i32(mb, 20)
+	E = peek_i32(mb, 24)
+	K = peek_i32(mb, 28)
+	L = peek_i32(mb, 32)
+	VOCAB = peek_i32(mb, 36)
+	SEQ = peek_i32(mb, 40)
+	NORM_TOPK = peek_i32(mb, 44)
+	KV = NKV * HD
+	off_embed = 0
+	layer_stride = D + D*D + KV*D + KV*D + D*D + D + E*D
+	off_layers = VOCAB * D
+	off_fnorm = off_layers + L * layer_stride
+	off_lmhead = off_fnorm + D
+	experts_base = off_lmhead + VOCAB * D
+	expert_stride = 3 * II * D
+}
+
+func alloc_moe() {
+	xb = alloc(D*4)  hb = alloc(D*4)  qb = alloc(D*4)  kb = alloc(KV*4)  vb = alloc(KV*4)
+	att = alloc(SEQ*4)  attn = alloc(D*4)  gbuf = alloc(II*4)  ubuf = alloc(II*4)  mo = alloc(D*4)
+	logits = alloc(VOCAB*4)
+	kcache = alloc(L*SEQ*KV*4)  vcache = alloc(L*SEQ*KV*4)
+	touched = alloc(E*L*4)
+}
+
+func rmsnorm(dst, src, woff, n) {
+	ss := 0.0
+	i := 0
+	while i < n { v := peek_f32(src, i*4)  ss = ss + v*v  i = i + 1 }
+	ss = 1.0 / sqrt(ss/float(n) + 0.00001)
+	i = 0
+	while i < n { poke_f32(dst, i*4, peek_f32(src, i*4) * ss * gf(woff + i))  i = i + 1 }
+}
+
+// y[o] = dot(W[o,:], x)  for o in 0..out ; W at float-offset woff, row-major [out,in]
+func matvec(dst, woff, x, out, inn) {
+	o := 0
+	while o < out { poke_f32(dst, o*4, dot_f32(gfp(woff + o*inn), x, inn))  o = o + 1 }
+}
+
+func rope(vec, pos) {
+	i := 0
+	while i < D {
+		hd := i % HD
+		freq := exp(-(float(hd)/float(HD)) * 9.210340371976182)  // 10000^(-hd/HD)
+		val := float(pos) * freq
+		c := cos(val)
+		s := sin(val)
+		v0 := peek_f32(vec, i*4)
+		v1 := peek_f32(vec, i*4+4)
+		poke_f32(vec, i*4, v0*c - v1*s)
+		poke_f32(vec, i*4+4, v0*s + v1*c)
+		i = i + 2
+	}
+}
+
+func softmax(p, n) {
+	mx := peek_f32(p, 0)
+	i := 1
+	while i < n { v := peek_f32(p, i*4)  if v > mx { mx = v }  i = i + 1 }
+	sm := 0.0
+	i = 0
+	while i < n { e := exp(peek_f32(p, i*4) - mx)  poke_f32(p, i*4, e)  sm = sm + e  i = i + 1 }
+	i = 0
+	while i < n { poke_f32(p, i*4, peek_f32(p, i*4) / sm)  i = i + 1 }
+}
+
+func attention(l, pos) {
+	loff := l * SEQ * KV
+	// scatter k,v to cache at pos
+	kc := kcache + (loff + pos*KV)*4
+	vc := vcache + (loff + pos*KV)*4
+	i := 0
+	while i < KV { poke_f32(kc, i*4, peek_f32(kb, i*4))  poke_f32(vc, i*4, peek_f32(vb, i*4))  i = i + 1 }
+	kv_mul := NH / NKV
+	h := 0
+	while h < NH {
+		qh := qb + h*HD*4
+		kvh := (h / kv_mul) * HD
+		t := 0
+		while t <= pos {
+			kt := kcache + (loff + t*KV + kvh)*4
+			poke_f32(att, t*4, dot_f32(qh, kt, HD) / sqrt(float(HD)))
+			t = t + 1
+		}
+		softmax(att, pos+1)
+		ah := attn + h*HD*4
+		j := 0
+		while j < HD { poke_f32(ah, j*4, 0.0)  j = j + 1 }
+		t = 0
+		while t <= pos {
+			vt := vcache + (loff + t*KV + kvh)*4
+			axpy_f32(ah, peek_f32(att, t*4), vt, HD)
+			t = t + 1
+		}
+		h = h + 1
+	}
+}
+
+// MoE FFN over hb -> mo. Reads ONLY the top-K routed experts (streaming).
+func moe(l) {
+	goff := off_layers + l*layer_stride + (D + D*D + KV*D + KV*D + D*D + D)  // gate [E,D]
+	matvec(logits, goff, hb, E, D)
+	softmax(logits, E)
+	// top-K by prob (partial selection, matches numpy argsort)
+	j := 0
+	while j < D { poke_f32(mo, j*4, 0.0)  j = j + 1 }
+	// find K best, tracking chosen mask via a small local scan
+	sumw := 0.0
+	kk := 0
+	// pass 1: collect the K indices + weights into att[0..2K) reuse (idx,val interleaved)
+	while kk < K {
+		best := 0 - 1
+		bv := 0.0 - 1000000000.0
+		e := 0
+		while e < E {
+			taken := 0
+			m := 0
+			while m < kk { if peek_i32(att, m*4) == e { taken = 1 }  m = m + 1 }
+			pe := peek_f32(logits, e*4)
+			if taken == 0 && pe > bv { bv = pe  best = e }
+			e = e + 1
+		}
+		poke_i32(att, kk*4, best)
+		poke_f32(att, (K+kk)*4, bv)
+		sumw = sumw + bv
+		kk = kk + 1
+	}
+	kk = 0
+	while kk < K {
+		eid := peek_i32(att, kk*4)
+		w := peek_f32(att, (K+kk)*4)
+		if NORM_TOPK == 1 { w = w / sumw }
+		poke_i32(touched, (l*E + eid)*4, 1)
+		ebase := experts_base + (l*E + eid)*expert_stride
+		// gate_proj [II,D], up_proj [II,D], down_proj [D,II]
+		matvec(gbuf, ebase, hb, II, D)
+		matvec(ubuf, ebase + II*D, hb, II, D)
+		i := 0
+		while i < II {
+			g := peek_f32(gbuf, i*4)
+			g = g / (1.0 + exp(0.0 - g))          // silu
+			poke_f32(gbuf, i*4, g * peek_f32(ubuf, i*4))
+			i = i + 1
+		}
+		// down_proj [D,II] applied to gbuf, accumulate w*y into mo
+		o := 0
+		while o < D { poke_f32(mo, o*4, peek_f32(mo, o*4) + w * dot_f32(gfp(ebase + 2*II*D + o*II), gbuf, II))  o = o + 1 }
+		kk = kk + 1
+	}
+}
+
+func forward(tok, pos) (best) {
+	// embed
+	i := 0
+	while i < D { poke_f32(xb, i*4, gf(off_embed + tok*D + i))  i = i + 1 }
+	l := 0
+	while l < L {
+		lo := off_layers + l*layer_stride
+		rmsnorm(hb, xb, lo, D)                      // in_ln
+		matvec(qb, lo + D, hb, D, D)                // q
+		matvec(kb, lo + D + D*D, hb, KV, D)         // k
+		matvec(vb, lo + D + D*D + KV*D, hb, KV, D)  // v
+		rope(qb, pos)  rope(kb, pos)
+		attention(l, pos)
+		matvec(hb, lo + D + D*D + KV*D + KV*D, attn, D, D)  // o_proj -> reuse hb
+		i = 0
+		while i < D { poke_f32(xb, i*4, peek_f32(xb, i*4) + peek_f32(hb, i*4))  i = i + 1 }
+		rmsnorm(hb, xb, lo + D + D*D + KV*D + KV*D + D*D, D)  // post_ln
+		moe(l)
+		i = 0
+		while i < D { poke_f32(xb, i*4, peek_f32(xb, i*4) + peek_f32(mo, i*4))  i = i + 1 }
+		l = l + 1
+	}
+	rmsnorm(hb, xb, off_fnorm, D)
+	matvec(logits, off_lmhead, hb, VOCAB, D)
+	bi := 0
+	bv := peek_f32(logits, 0)
+	i = 1
+	while i < VOCAB { v := peek_f32(logits, i*4)  if v > bv { bv = v  bi = i }  i = i + 1 }
+	return bi
+}
+
+func main() {
+	a := args()
+	path := "models/moe-spike.bin"
+	if len(a) > 1 { path = a[1] }
+	load_moe(path)
+	alloc_moe()
+	println("MoE spike loaded: D=" + str(D) + " experts=" + str(E) + " top-k=" + str(K) + " layers=" + str(L) + " vocab=" + str(VOCAB))
+	// prompt = [1,2,3,4,5]; prefill 1..4, then generate 12
+	prompt := []int{1, 2, 3, 4, 5}
+	pos := 0
+	np := len(prompt)
+	i := 0
+	while i < np - 1 { forward(prompt[i], pos)  pos = pos + 1  i = i + 1 }
+	cur := prompt[np-1]
+	out := ""
+	nnew := 12
+	i = 0
+	while i < nnew {
+		cur = forward(cur, pos)
+		pos = pos + 1
+		out = out + str(cur)
+		if i < nnew - 1 { out = out + ", " }
+		i = i + 1
+	}
+	println("MFL tokens: [" + out + "]")
+	// streaming proof: how many experts were actually read
+	nt := 0
+	i = 0
+	while i < E*L { if peek_i32(touched, i*4) == 1 { nt = nt + 1 }  i = i + 1 }
+	println("experts touched (streamed in): " + str(nt) + " / " + str(E*L) + " total")
+}
