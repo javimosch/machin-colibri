@@ -104,15 +104,23 @@ The [performance frontier doc](docs/PERFORMANCE-FRONTIER.md) reaches a clean con
 **OLMoE-1B-7B now runs in this engine, in pure MFL** ([cert](certs/M7-olmoe.md)). A Mixture-of-Experts model decouples quality (total parameters) from speed (the few *active* per token): OLMoE-1B-7B is **6.9B total but only 1.3B active** (64 experts/layer, top-8 routed). Only the routed experts are read each token, so the cold ones are **`mmap`-streamed on demand** — the OS page cache is a free per-layer LRU, and total model size is bounded by *disk*, not RAM.
 
 ```
-$ COLIBRI_THREADS=8 ./olmoe models/olmoe-q8.bin
+$ COLIBRI_THREADS=8 ./olmoe models/olmoe-q8-lm8.bin
   OLMoE loaded: 64 experts · top-8 · 16 layers · pure MFL
   "The capital of France is Paris. The capital of the United States is Washington"
-  11.5 tok/s · experts streamed in: 622/1024 · token-identical to fp32 reference
+  14.5 tok/s · experts streamed in: 622/1024 · token-identical to fp32 reference
 ```
 
-- **Token-identical to the numpy fp32 ground truth** — quantization didn't flip a single token (12/12), at both **int8** (7.96 GB) *and* **int4 experts** (4.74 GB).
-- **11.5 tok/s** on a laptop (8 cores), near the DDR ceiling for the active-param footprint.
-- **int4 experts halve the footprint** to 4.74 GB (fits a smaller box) — still token-identical; slightly slower on a compute-balanced CPU (the [balanced-roofline wall](docs/PERFORMANCE-FRONTIER.md)), a footprint win, not a speed one.
+- **Token-identical to the numpy fp32 ground truth** across *every* quantization — int8, int4 experts, and int8 lm_head all reproduce fp32 12/12.
+- **14.5 tok/s** on a laptop (8 cores), near the DDR ceiling for the active-param footprint.
+- **Pick your tradeoff** — same engine, four measured configs ([cert](certs/M7-olmoe.md)):
+
+  | experts | lm_head | size | tok/s |
+  |---|---|---|---|
+  | int8 | int8 | 7.65 GB | **14.5** (fastest) |
+  | int4 | int8 | **4.43 GB** | 11.2 (smallest) |
+  | int8 | fp32 | 7.96 GB | 9.4 |
+  | int4 | fp32 | 4.74 GB | 7.4 |
+
 - Same pure-MFL engine, same `dot_q8`/`dot_q4` kernels, same `mmap_file` streaming.
 
 **7B-class quality at ~1B speed, on hardware you own — in a language you'd never heard of.**

@@ -49,13 +49,24 @@ here for the token-identical result.)
 | experts | lm_head | .bin size | tokens vs fp32 | tok/s (8 thr, warm) |
 |---|---|---|---|---|
 | int8 | fp32 | 7.96 GB | identical (12/12) | 9.4 |
-| **int4** | fp32 | **4.74 GB** | **identical (12/12)** | 7.4 |
+| int4 | fp32 | 4.74 GB | identical (12/12) | 7.4 |
+| **int8** | **int8** | 7.65 GB | **identical (12/12)** | **14.5** ⚡ best speed |
+| **int4** | **int8** | **4.43 GB** | **identical (12/12)** | 11.2 — best footprint |
 
-int4 experts **halve the expert footprint and stay token-identical** — but they are
-*slower* on this box (7.4 < 9.4): the same balanced-roofline wall the dense int4
-hit. Halving expert bytes drops below the memory ceiling and exposes the `dot_q4`
-nibble-unpack compute + the unchanged fp32 lm_head traffic. The win is **fitting a
-smaller box** (RAM/disk), not speed — exactly the frontier prediction.
+**Every config is token-identical to the fp32 reference** — quantization never
+flipped a token, even int4-experts + int8-lm_head.
+
+Two independent levers, both measured:
+- **int8 lm_head** is the big speed win (9.4→14.5, and 7.4→11.2): the fp32 lm_head
+  was 412 MB/token, int8 cuts it to 103 MB — decode is memory-bound so this is
+  near-linear. Kept the token-identical result too.
+- **int4 experts** halve the expert footprint (6.85→3.4 GB) and stay
+  token-identical, but are *slower* on this compute-balanced box (the same
+  balanced-roofline wall the dense int4 hit — `dot_q4` nibble-unpack compute
+  outweighs the memory saved). A footprint lever, not a speed one.
+
+Pick by constraint: **int8+int8** for max speed (14.5 tok/s), **int4+int8** for the
+smallest box (4.43 GB, still 11.2 tok/s).
 
 ## Why it matters
 The dense 1B hit a ~20 tok/s wall priced at *total* params. OLMoE delivers
