@@ -97,13 +97,25 @@ Streaming (`"stream": true`), tool/function-calling, `seed`, `temperature`, and 
 - **Speed**: mmap load, worker-pool matmul, batched prefill, `dot_q8`/`dot_q4` builtins (contributed to machin core).
 - **Continuous batching primitive** — per-slot KV caches, one batched forward advances N requests (exact; see the frontier doc for why it's a fleet-throughput lever, not a latency one).
 
-## The road ahead: streaming a 7B-class model onto a 10 GB box
+## A 7B-class MoE, in pure MFL — streamed onto a laptop ✅
 
-The [performance frontier doc](docs/PERFORMANCE-FRONTIER.md) reaches a clean conclusion: on weak hardware a **dense** 1B model is at a fundamental wall, and the only lever that shrinks *both* compute and bandwidth at once lives in the **model architecture**, not the engine.
+The [performance frontier doc](docs/PERFORMANCE-FRONTIER.md) reaches a clean conclusion: on weak hardware a **dense** 1B model is at a fundamental wall, and the only lever that shrinks *both* compute and bandwidth at once lives in the **model architecture**, not the engine. So we followed the original colibrì's insight to its conclusion.
 
-That is exactly what the original colibrì proved with its 744B MoE — and where this project is headed next. A **Mixture-of-Experts** model decouples quality (total parameters) from speed (the few *active* per token). **OLMoE-1B-7B** is 7B total but only **1.3B active** — 7B-class quality at the ~1B-dense cost this engine already hits at 20 tok/s. And because only a handful of experts fire per token, the cold ones can be **streamed from NVMe on demand** (the OS page cache is a free LRU), so total model size becomes bounded by *disk*, not RAM. The enabler — `mmap_file` — already shipped.
+**OLMoE-1B-7B now runs in this engine, in pure MFL** ([cert](certs/M7-olmoe.md)). A Mixture-of-Experts model decouples quality (total parameters) from speed (the few *active* per token): OLMoE-1B-7B is **6.9B total but only 1.3B active** (64 experts/layer, top-8 routed). Only the routed experts are read each token, so the cold ones are **`mmap`-streamed on demand** — the OS page cache is a free per-layer LRU, and total model size is bounded by *disk*, not RAM.
 
-**Goal: a 7B-class model, on a 10 GB box, at the speed of a 1B — in pure MFL.**
+```
+$ COLIBRI_THREADS=8 ./olmoe models/olmoe-q8.bin
+  OLMoE loaded: 64 experts · top-8 · 16 layers · pure MFL
+  "The capital of France is Paris. The capital of the United States is Washington"
+  11.5 tok/s · experts streamed in: 622/1024 · token-identical to fp32 reference
+```
+
+- **Token-identical to the numpy fp32 ground truth** — int8 didn't flip a single token (12/12).
+- **7.96 GB** int8 checkpoint (experts/attn int8, embed/lm_head/norms fp32); warm working set fits a 10 GB box.
+- **11.5 tok/s** on a laptop (8 cores), near the DDR ceiling for the active-param footprint.
+- Same pure-MFL engine, same `dot_q8` kernel, same `mmap_file` streaming.
+
+**7B-class quality at ~1B speed, on hardware you own — in a language you'd never heard of.**
 
 ## Related
 

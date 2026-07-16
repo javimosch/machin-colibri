@@ -1,0 +1,408 @@
+// Pure-MFL OLMoE-1B-7B inference: 7B total / 1.3B active (64 experts, top-8).
+// Dense trunk resident; experts mmap'd + read only when routed (streaming).
+// int8 Q8_0 matmuls (dot_q8) for attn/router/experts; fp32 embed/lm_head/norms.
+// Arch faithful to HF OlmoeForCausalLM: qk-norm (RMSNorm over full q/k proj),
+// rotate_half RoPE (theta 1e4), norm_topk_prob=false, separate lm_head.
+
+var mb = 0
+var D = 0
+var NH = 0
+var NKV = 0
+var HD = 0
+var II = 0
+var E = 0
+var K = 0
+var L = 0
+var VOCAB = 0
+var SEQ = 0
+var GS = 0
+var HALF = 0
+var DSC = 0   // D*D/GS  (scales per [D,D] matrix)
+var ISC = 0   // I*D/GS  (scales per expert matrix)
+var blk_attn = 0
+var attn_stride = 0
+var router_layer = 0
+var eblk = 0        // one expert sub-matrix block bytes = I*D + 4*ISC
+var expert_stride = 0
+// section base byte-offsets (from header)
+var embed_off = 0
+var norms_off = 0
+var fnorm_off = 0
+var lmhead_off = 0
+var attn_off = 0
+var router_off = 0
+var experts_off = 0
+
+// scratch
+var xx = 0    // D residual
+var hh = 0    // D normed
+var qb = 0    // D
+var kb = 0    // D
+var vb = 0    // D
+var attn = 0  // D
+var moe = 0   // D
+var xqb = 0   // D bytes (quant activations)
+var xsb = 0   // (D/GS) f32
+var gbuf = 0  // I
+var ubuf = 0  // I
+var att = 0   // SEQ
+var logits = 0
+var kcache = 0
+var vcache = 0
+var rinv = 0  // HALF inv-freqs
+var rcos = 0  // HALF
+var rsin = 0  // HALF
+var touched = 0 // E*L streaming counter
+
+// worker pool
+var n_workers = 1
+var jobs = make(chan int)
+var done = make(chan int)
+var pending = 0
+// job context (set before each dispatch; stable during it thanks to barrier)
+var gj_dst = 0
+var gj_wq = 0
+var gj_ws = 0
+var gj_n = 0
+var gj_wf = 0   // fp32 weight byte-offset (lm_head)
+var gj_w = 0.0  // scalar weight (down-proj accumulate)
+
+func load_olmoe(path) {
+	m, _ := mmap_file(path)
+	mb = m
+	if peek_i32(mb, 0) != 1634422065 { println("bad magic")  flush() }  // 0x616B4D31 akM1
+	D = peek_i32(mb, 4)
+	NH = peek_i32(mb, 8)
+	NKV = peek_i32(mb, 12)
+	HD = peek_i32(mb, 16)
+	II = peek_i32(mb, 20)
+	E = peek_i32(mb, 24)
+	K = peek_i32(mb, 28)
+	L = peek_i32(mb, 32)
+	VOCAB = peek_i32(mb, 36)
+	SEQ = peek_i32(mb, 40)
+	GS = peek_i32(mb, 44)
+	embed_off = peek_i32(mb, 48)
+	norms_off = peek_i32(mb, 52)
+	fnorm_off = peek_i32(mb, 56)
+	lmhead_off = peek_i32(mb, 60)
+	attn_off = peek_i32(mb, 64)
+	router_off = peek_i32(mb, 68)
+	experts_off = peek_i32(mb, 72)
+	HALF = HD / 2
+	DSC = (D * D) / GS
+	ISC = (II * D) / GS
+	blk_attn = D*D + 4*DSC
+	attn_stride = 4 * blk_attn
+	router_layer = E*D + 4*((E*D)/GS)
+	eblk = II*D + 4*ISC
+	expert_stride = 3 * eblk
+}
+
+func alloc_olmoe() {
+	xx = alloc(D*4)  hh = alloc(D*4)  qb = alloc(D*4)  kb = alloc(D*4)  vb = alloc(D*4)
+	attn = alloc(D*4)  moe = alloc(D*4)
+	xqb = alloc(D)  xsb = alloc((D/GS)*4)
+	gbuf = alloc(II*4)  ubuf = alloc(II*4)
+	att = alloc(SEQ*4)  logits = alloc(VOCAB*4)
+	kcache = alloc(L*SEQ*D*4)  vcache = alloc(L*SEQ*D*4)
+	rinv = alloc(HALF*4)  rcos = alloc(HALF*4)  rsin = alloc(HALF*4)
+	touched = alloc(E*L*4)
+	i := 0
+	while i < HALF {
+		poke_f32(rinv, i*4, exp(0.0 - (float(i)/float(HALF)) * 9.210340371976182))
+		i = i + 1
+	}
+}
+
+func rmsnorm(dst, src, woff, n) {
+	ss := 0.0
+	i := 0
+	while i < n { v := peek_f32(src, i*4)  ss = ss + v*v  i = i + 1 }
+	ss = 1.0 / sqrt(ss/float(n) + 0.00001)
+	i = 0
+	while i < n { poke_f32(dst, i*4, peek_f32(src, i*4) * ss * peek_f32(mb, woff + i*4))  i = i + 1 }
+}
+
+func quantize_act(xq, xs, x, n) {
+	ng := n / GS
+	g := 0
+	while g < ng {
+		base := g * GS
+		wmax := 0.0
+		i := 0
+		while i < GS { v := abs(peek_f32(x, (base+i)*4))  if v > wmax { wmax = v }  i = i + 1 }
+		scale := wmax / 127.0
+		poke_f32(xs, g*4, scale)
+		i = 0
+		while i < GS {
+			q := 0
+			if scale > 0.0 { q = int(round(peek_f32(x, (base+i)*4) / scale)) }
+			poke_u8(xq, base+i, q & 255)
+			i = i + 1
+		}
+		g = g + 1
+	}
+}
+
+// ---- worker pool: parallelize the per-output-row matmul loops ----
+func do_job(j, att) {
+	t := j & 31
+	l := (j >> 5) & 255
+	pos := (j >> 13) & 4095
+	lo := (j >> 25) & 524287
+	hi := j >> 44
+	if t == 1 {   // quantized matmul: gj_dst[o] = W[o,:].x  (x pre-quantized in xqb/xsb)
+		nsc := gj_n / GS
+		o := lo
+		while o < hi { poke_f32(gj_dst, o*4, dot_q8(xqb, xsb, gj_wq + o*gj_n, gj_ws + o*nsc*4, gj_n, GS))  o = o + 1 }
+	}
+	if t == 2 {   // fp32 lm_head: logits[o] = lmhead[o,:] . hh
+		o := lo
+		while o < hi { poke_f32(logits, o*4, dot_f32(mb + gj_wf + o*D*4, hh, D))  o = o + 1 }
+	}
+	if t == 3 {   // attention over heads [lo,hi)
+		h := lo
+		while h < hi { attn_head(l, pos, h, att)  h = h + 1 }
+	}
+	if t == 4 {   // down-proj accumulate: moe[o] += gj_w * W[o,:].gbuf(quantized)
+		nsc := gj_n / GS
+		o := lo
+		while o < hi { poke_f32(moe, o*4, peek_f32(moe, o*4) + gj_w * dot_q8(xqb, xsb, gj_wq + o*gj_n, gj_ws + o*nsc*4, gj_n, GS))  o = o + 1 }
+	}
+}
+
+func worker(jc, dc) {
+	att := alloc(SEQ * 4)   // per-worker attention-score scratch
+	for j := range jc {
+		do_job(j, att)
+		dc <- 1
+	}
+}
+
+func dispatch_rows(t, l, pos, d) {
+	nc := n_workers
+	if nc > d { nc = d }
+	chunk := (d + nc - 1) / nc
+	lo := 0
+	while lo < d {
+		hi := lo + chunk
+		if hi > d { hi = d }
+		if pending >= n_workers { <-done  pending = pending - 1 }
+		jobs <- (t | l << 5 | pos << 13 | lo << 25 | hi << 44)
+		pending = pending + 1
+		lo = hi
+	}
+}
+
+func barrier() {
+	while pending > 0 { <-done  pending = pending - 1 }
+}
+
+// dst[o] = W_int8[o,:] . x   (parallelized); wq/ws absolute byte ptrs
+func matmul_q8(dst, wq, ws, x, out, inn) {
+	quantize_act(xqb, xsb, x, inn)
+	gj_dst = dst  gj_wq = wq  gj_ws = ws  gj_n = inn
+	dispatch_rows(1, 0, 0, out)
+	barrier()
+}
+
+// HF rotate_half rope on a [D] vector reshaped as NH heads of HD; uses rcos/rsin
+func rope(vec) {
+	h := 0
+	while h < NH {
+		b := h * HD
+		i := 0
+		while i < HALF {
+			c := peek_f32(rcos, i*4)
+			s := peek_f32(rsin, i*4)
+			a := peek_f32(vec, (b+i)*4)
+			bb := peek_f32(vec, (b+i+HALF)*4)
+			poke_f32(vec, (b+i)*4, a*c - bb*s)
+			poke_f32(vec, (b+i+HALF)*4, bb*c + a*s)
+			i = i + 1
+		}
+		h = h + 1
+	}
+}
+
+func softmax(p, n) {
+	mx := peek_f32(p, 0)
+	i := 1
+	while i < n { v := peek_f32(p, i*4)  if v > mx { mx = v }  i = i + 1 }
+	sm := 0.0
+	i = 0
+	while i < n { e := exp(peek_f32(p, i*4) - mx)  poke_f32(p, i*4, e)  sm = sm + e  i = i + 1 }
+	i = 0
+	while i < n { poke_f32(p, i*4, peek_f32(p, i*4) / sm)  i = i + 1 }
+}
+
+// one attention head h (own score scratch `att`); writes attn[h*HD..]
+func attn_head(l, pos, h, att) {
+	loff := l * SEQ * D
+	qh := qb + h*HD*4
+	t := 0
+	while t <= pos {
+		kt := kcache + (loff + t*D + h*HD)*4
+		poke_f32(att, t*4, dot_f32(qh, kt, HD) / sqrt(float(HD)))
+		t = t + 1
+	}
+	softmax(att, pos+1)
+	ah := attn + h*HD*4
+	j := 0
+	while j < HD { poke_f32(ah, j*4, 0.0)  j = j + 1 }
+	t = 0
+	while t <= pos {
+		vt := vcache + (loff + t*D + h*HD)*4
+		axpy_f32(ah, peek_f32(att, t*4), vt, HD)
+		t = t + 1
+	}
+}
+
+func attention(l, pos) {
+	loff := l * SEQ * D
+	kc := kcache + (loff + pos*D)*4
+	vc := vcache + (loff + pos*D)*4
+	i := 0
+	while i < D { poke_f32(kc, i*4, peek_f32(kb, i*4))  poke_f32(vc, i*4, peek_f32(vb, i*4))  i = i + 1 }
+	dispatch_rows(3, l, pos, NH)
+	barrier()
+}
+
+// MoE: router -> top-K (norm_topk_prob=false, use raw softmax probs) -> experts
+func moe_ffn(l) {
+	rq := router_off + l*router_layer
+	matmul_q8(logits, mb + rq, mb + rq + E*D, hh, E, D)
+	softmax(logits, E)
+	j := 0
+	while j < D { poke_f32(moe, j*4, 0.0)  j = j + 1 }
+	// top-K by prob, tracked in att (idx int, val f32 interleaved)
+	kk := 0
+	while kk < K {
+		best := 0 - 1
+		bv := 0.0 - 1000000000.0
+		e := 0
+		while e < E {
+			taken := 0
+			m := 0
+			while m < kk { if peek_i32(att, m*4) == e { taken = 1 }  m = m + 1 }
+			pe := peek_f32(logits, e*4)
+			if taken == 0 && pe > bv { bv = pe  best = e }
+			e = e + 1
+		}
+		poke_i32(att, kk*4, best)
+		poke_f32(att, (K+kk)*4, bv)
+		kk = kk + 1
+	}
+	kk = 0
+	while kk < K {
+		eid := peek_i32(att, kk*4)
+		w := peek_f32(att, (K+kk)*4)
+		poke_i32(touched, (l*E + eid)*4, 1)
+		eb := experts_off + (l*E + eid)*expert_stride
+		gq := eb
+		gsx := eb + II*D
+		uq := eb + eblk
+		usx := eb + eblk + II*D
+		dq := eb + 2*eblk
+		dsx := eb + 2*eblk + D*II
+		matmul_q8(gbuf, mb + gq, mb + gsx, hh, II, D)   // gate_proj [I,D]
+		matmul_q8(ubuf, mb + uq, mb + usx, hh, II, D)   // up_proj   [I,D]
+		i := 0
+		while i < II {
+			g := peek_f32(gbuf, i*4)
+			g = g / (1.0 + exp(0.0 - g))
+			poke_f32(gbuf, i*4, g * peek_f32(ubuf, i*4))
+			i = i + 1
+		}
+		// down_proj [D,I] applied to gbuf -> accumulate w*y into moe (parallel)
+		quantize_act(xqb, xsb, gbuf, II)
+		gj_wq = mb + dq  gj_ws = mb + dsx  gj_n = II  gj_w = w
+		dispatch_rows(4, 0, 0, D)
+		barrier()
+		kk = kk + 1
+	}
+}
+
+func forward(tok, pos) (best) {
+	// rope tables for this pos
+	i := 0
+	while i < HALF {
+		ang := float(pos) * peek_f32(rinv, i*4)
+		poke_f32(rcos, i*4, cos(ang))
+		poke_f32(rsin, i*4, sin(ang))
+		i = i + 1
+	}
+	// embed (fp32 lookup)
+	i = 0
+	while i < D { poke_f32(xx, i*4, peek_f32(mb, embed_off + (tok*D + i)*4))  i = i + 1 }
+	l := 0
+	while l < L {
+		nb := norms_off + l*(4*D*4)
+		rmsnorm(hh, xx, nb, D)                    // input_layernorm
+		ab := attn_off + l*attn_stride
+		matmul_q8(qb, mb + ab, mb + ab + D*D, hh, D, D)                        // q_proj
+		matmul_q8(kb, mb + ab + blk_attn, mb + ab + blk_attn + D*D, hh, D, D)  // k_proj
+		matmul_q8(vb, mb + ab + 2*blk_attn, mb + ab + 2*blk_attn + D*D, hh, D, D) // v_proj
+		rmsnorm(qb, qb, nb + D*4, D)              // q_norm (over full D)
+		rmsnorm(kb, kb, nb + 2*D*4, D)            // k_norm
+		rope(qb)  rope(kb)
+		attention(l, pos)
+		matmul_q8(hh, mb + ab + 3*blk_attn, mb + ab + 3*blk_attn + D*D, attn, D, D) // o_proj -> hh
+		i = 0
+		while i < D { poke_f32(xx, i*4, peek_f32(xx, i*4) + peek_f32(hh, i*4))  i = i + 1 }
+		rmsnorm(hh, xx, nb + 3*D*4, D)            // post_attention_layernorm
+		moe_ffn(l)
+		i = 0
+		while i < D { poke_f32(xx, i*4, peek_f32(xx, i*4) + peek_f32(moe, i*4))  i = i + 1 }
+		l = l + 1
+	}
+	rmsnorm(hh, xx, fnorm_off, D)
+	gj_wf = lmhead_off
+	dispatch_rows(2, 0, 0, VOCAB)   // lm_head fp32 matvec (reads hh)
+	barrier()
+	bi := 0
+	bv := peek_f32(logits, 0)
+	i = 1
+	while i < VOCAB { v := peek_f32(logits, i*4)  if v > bv { bv = v  bi = i }  i = i + 1 }
+	return bi
+}
+
+func main() {
+	a := args()
+	path := "models/olmoe-q8.bin"
+	if len(a) > 1 { path = a[1] }
+	load_olmoe(path)
+	alloc_olmoe()
+	nw := parse_int(env("COLIBRI_THREADS"))
+	if nw > 0 { n_workers = nw } else { n_workers = 6 }
+	w := 0
+	while w < n_workers { go worker(jobs, done)  w = w + 1 }
+	println("OLMoE loaded: D=" + str(D) + " experts=" + str(E) + " top-k=" + str(K) + " layers=" + str(L) + " vocab=" + str(VOCAB) + " | " + str(n_workers) + " workers")
+	flush()
+	// ref.json prompt "The capital of France is"
+	prompt := []int{510, 5347, 273, 6181, 310}
+	nnew := 12
+	pos := 0
+	np := len(prompt)
+	t0 := now_ms()
+	i := 0
+	while i < np - 1 { forward(prompt[i], pos)  pos = pos + 1  i = i + 1 }
+	cur := prompt[np-1]
+	out := ""
+	i = 0
+	while i < nnew {
+		cur = forward(cur, pos)
+		pos = pos + 1
+		out = out + str(cur)
+		if i < nnew - 1 { out = out + ", " }
+		i = i + 1
+	}
+	t1 := now_ms()
+	println("MFL tokens: [" + out + "]")
+	println("expected  : [7785, 15, 187, 187, 510, 3565, 3448, 273, 6181, 310, 5112, 15]")
+	nt := 0
+	i = 0
+	while i < E*L { if peek_i32(touched, i*4) == 1 { nt = nt + 1 }  i = i + 1 }
+	println("experts streamed in: " + str(nt) + " / " + str(E*L) + "  |  " + str(float((np-1+nnew)*1000)/float(t1-t0)) + " tok/s")
+}

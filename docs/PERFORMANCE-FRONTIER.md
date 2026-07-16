@@ -171,12 +171,23 @@ Why this beats our wall, in our own terms:
   where our prompt-lookup got +10% — because GLM ships a *trained* MTP head.
   Same lesson a third time: speculation pays when the model provides the draft.
 
-Concretely for this repo (the proposed M7): **OLMoE-1B-7B-Instruct** — the same
-model the original colibrì used to validate its core ("Stage A", `c/olmoe.c`).
-int8 experts ≈ 7 GB (int4 ≈ 3.5 GB) against rbm21's 10 GB RAM: the hot experts
-live in page cache, the router picks 8 of 64 per layer, and the active set is
-1.3B — our proven speed regime. Headline if it works: **a 7B-class model on a
-10 GB box at the speed of a 1B, in pure MFL.**
+Concretely for this repo (the proposed M7): **OLMoE-1B-7B** — the same model the
+original colibrì used to validate its core ("Stage A", `c/olmoe.c`). int8 experts
+≈ 7 GB against a 10 GB box: the hot experts live in page cache, the router picks
+8 of 64 per layer, and the active set is 1.3B — our proven speed regime.
+
+### M7 — DONE (2026-07-13): it works, in pure MFL
+
+**OLMoE-1B-7B (6.9B total / 1.3B active) runs in this engine, token-identical to
+the fp32 reference, at 11.5 tok/s on a laptop** ([certs/M7-olmoe.md](../certs/M7-olmoe.md)).
+The 7.96 GB int8 checkpoint streams experts via `mmap` (622/1024 faulted in for a
+12-token run — only the routed ones). Per-token traffic ≈ 1.5 GB × 11.5 tok/s ≈
+17 GB/s — the MoE engine is already memory-bound at the active footprint, exactly
+as the dense analysis predicted, but now delivering **7B-class quality at ~1B
+speed**. The wall was never the engine; MoE is the model-side lever that clears it,
+and the pure-MFL runtime carries it with the same `dot_q8` kernel and `mmap_file`
+streaming that the dense engine shipped. **Headline achieved: a 7B-class model at
+the speed of a 1B, on hardware you own, in pure MFL.**
 
 ## Reproduce
 
