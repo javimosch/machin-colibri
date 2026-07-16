@@ -6,6 +6,7 @@ After=network.target
 Type=simple
 WorkingDirectory=/home/jarancibia/ai/machin-colibri
 Environment=COLIBRI_THREADS=8
+Environment=COLIBRI_IDLE=300
 ExecStart=/home/jarancibia/ai/machin-colibri/serve_olmoe /home/jarancibia/ai/machin-colibri/models/olmoe-q8-lm8.bin 8091 /home/jarancibia/ai/machin-colibri/models/olmoe-tok.bin
 Restart=on-failure
 RestartSec=5

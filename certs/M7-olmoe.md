@@ -94,6 +94,27 @@ Load time 31 ms (mmap). Deploy unit: `deploy/olmoe-serve.service`. (OLMoE-0924 i
 a *base* model — completions, not chat-tuned; the Instruct variant would add a
 chat template, same engine.)
 
+## Idle model release (calm-period footprint)
+
+The model is `mmap`'d, so at rest it costs **0% CPU, 0 disk, ~27 MB anonymous RAM**
+— the rest of the RSS is reclaimable file cache. To drop even that during calm
+periods, the server has an **idle watchdog**: after `COLIBRI_IDLE` seconds of no
+requests it calls `madvise(MADV_DONTNEED)` on the mmap, and the resident pages
+release. Measured cycle:
+
+```
+after start (lazy, no request):  24 MB
+after a request:               4050 MB
+after idle timeout:              27 MB   <- released
+next request (re-faults):      4050 MB, output identical
+```
+
+The mapping stays valid, so the next request re-faults the pages lazily (from page
+cache if warm, else disk) with **no reload and no code path change** — output is
+byte-identical across the release/re-fault cycle. `COLIBRI_IDLE=0` disables it;
+default 300 s. Needs machin's `madvise_free(ptr, len)` builtin (contributed
+upstream from this project, like `mmap_file`/`dot_q8`).
+
 ## Reproduce
 ```bash
 # download (13.8 GB bf16)

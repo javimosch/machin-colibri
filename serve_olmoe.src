@@ -6,12 +6,35 @@
 var model_id = "olmoe-1b-7b"
 var mu_acq = make(chan int)
 var mu_rel = make(chan int)
+// idle model release: after IDLE_SECS of no requests, madvise(DONTNEED) the
+// mmap'd model so its resident pages drop (RSS -> tens of MB, 0 CPU/disk);
+// pages re-fault lazily on the next request. COLIBRI_IDLE=0 disables.
+var last_req = 0
+var released = 0
+var idle_ms = 300000   // 5 min default
 
 func mutex_srv(acq, rel) {
 	while true {
 		acq <- 1
 		v := <-rel
 		if v < 0 { break }
+	}
+}
+
+// background: release the model's resident pages once idle past idle_ms
+func idle_watchdog() {
+	while true {
+		sleep(30000)
+		if idle_ms > 0 && released == 0 && now_ms() - last_req > idle_ms {
+			g := <-mu_acq                                  // no generation in flight
+			if released == 0 && now_ms() - last_req > idle_ms {
+				madvise_free(mb, model_bytes)
+				released = 1
+				println("[colibri] idle " + str((now_ms()-last_req)/1000) + "s -> released model pages (mmap re-faults on next request)")
+				flush()
+			}
+			mu_rel <- 1
+		}
 	}
 }
 
@@ -71,10 +94,13 @@ func handle_chat(reqbody) (res) {
 	if len(me) == 0 { v := parse_int(mn)  if v > 0 { max_new = v } }
 	ids := tok_encode(text)
 	if len(ids) == 0 { ids = append(ids, 0) }
+	last_req = now_ms()
+	released = 0
 	g := <-mu_acq          // acquire single-flight lock
 	out := gen_ids(ids, len(ids), max_new)
 	g = g
 	mu_rel <- 1            // release
+	last_req = now_ms()
 	reply := tok_decode(out)
 	np := len(ids)
 	n := len(out)
@@ -102,8 +128,12 @@ func main() {
 	t0 := now_ms()
 	olmoe_init(path)
 	load_tok(tokf)
+	is := parse_int(env("COLIBRI_IDLE"))   // idle-release seconds; 0 = disabled
+	if len(env("COLIBRI_IDLE")) > 0 { idle_ms = is * 1000 }
+	last_req = now_ms()
 	go mutex_srv(mu_acq, mu_rel)
-	println("olmoe serve: " + model_id + " experts=" + str(E) + " (int" + str(ebits) + ", lm_head " + str(lmbits) + ") loaded in " + str(now_ms()-t0) + " ms, " + str(n_workers) + " workers")
+	go idle_watchdog()
+	println("olmoe serve: " + model_id + " experts=" + str(E) + " (int" + str(ebits) + ", lm_head " + str(lmbits) + ") loaded in " + str(now_ms()-t0) + " ms, " + str(n_workers) + " workers, idle-release " + str(idle_ms/1000) + "s")
 	println("OpenAI-compatible API on http://0.0.0.0:" + str(port) + "/v1")
 	serve(port, func(req) { return api_route(req) })
 }

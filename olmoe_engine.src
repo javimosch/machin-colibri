@@ -5,6 +5,7 @@
 // rotate_half RoPE (theta 1e4), norm_topk_prob=false, separate lm_head.
 
 var mb = 0
+var model_bytes = 0   // mmap length (for idle madvise_free release)
 var D = 0
 var NH = 0
 var NKV = 0
@@ -71,8 +72,9 @@ var gj_wf = 0   // fp32 weight byte-offset (lm_head)
 var gj_w = 0.0  // scalar weight (down-proj accumulate)
 
 func load_olmoe(path) {
-	m, _ := mmap_file(path)
+	m, sz := mmap_file(path)
 	mb = m
+	model_bytes = sz
 	if peek_i32(mb, 0) != 1634422065 { println("bad magic")  flush() }  // 0x616B4D31 akM1
 	D = peek_i32(mb, 4)
 	NH = peek_i32(mb, 8)
