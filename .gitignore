@@ -16,3 +16,6 @@ moe-spike
 olmoe.mfl
 olmoe_engine
 olmoe-hf/
+serve_olmoe.mfl
+serve_olmoe
+olmoe_cli

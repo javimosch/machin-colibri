@@ -122,6 +122,12 @@ $ COLIBRI_THREADS=8 ./olmoe models/olmoe-q8-lm8.bin
   | int4 | fp32 | 4.74 GB | 7.4 |
 
 - Same pure-MFL engine, same `dot_q8`/`dot_q4` kernels, same `mmap_file` streaming.
+- **OpenAI-compatible server** — including the OLMoE byte-level BPE tokenizer, written in pure MFL. Verified with the official `openai` client:
+
+  ```bash
+  COLIBRI_THREADS=8 ./serve_olmoe models/olmoe-q8-lm8.bin 8091 models/olmoe-tok.bin
+  # POST /v1/chat/completions -> "The capital of France is Paris. The capital of the United States is Washington, D.C."
+  ```
 
 **7B-class quality at ~1B speed, on hardware you own — in a language you'd never heard of.**
 

@@ -1,0 +1,16 @@
+[Unit]
+Description=colibri OLMoE — pure-MFL OpenAI server (OLMoE-1B-7B MoE)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/colibri
+Environment=COLIBRI_THREADS=8
+ExecStart=/opt/colibri/serve_olmoe /opt/colibri/models/olmoe-q8-lm8.bin 8091 /opt/colibri/models/olmoe-tok.bin
+Nice=10
+Restart=on-failure
+RestartSec=5
+MemoryMax=10G
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,109 @@
+// OLMoE OpenAI-compatible server in pure MFL.
+// Build: machin encode framework/machweb.src olmoe_engine.src olmoe_tok.src serve_olmoe.src > serve_olmoe.mfl
+// Endpoints: GET /v1/models, GET /health, POST /v1/chat/completions (non-stream).
+// Single-flight generation via a mutex-as-service (shared worker pool, one gen at a time).
+
+var model_id = "olmoe-1b-7b"
+var mu_acq = make(chan int)
+var mu_rel = make(chan int)
+
+func mutex_srv(acq, rel) {
+	while true {
+		acq <- 1
+		v := <-rel
+		if v < 0 { break }
+	}
+}
+
+func json_esc(s) (o) {
+	o = replace(s, "\\", "\\\\")
+	o = replace(o, "\"", "\\\"")
+	o = replace(o, "\n", "\\n")
+	o = replace(o, "\r", "\\r")
+	o = replace(o, "\t", "\\t")
+	return
+}
+
+// strip surrounding quotes + unescape the common JSON string escapes
+func json_str(s) (o) {
+	v := s
+	if len(v) >= 2 && has_prefix(v, "\"") && has_suffix(v, "\"") { v = substr(v, 1, len(v)-1) }
+	o = ""
+	b := bytes(v)
+	n := len(b)
+	i := 0
+	while i < n {
+		c := byte_at(b, i)
+		if c == 92 && i+1 < n {
+			d := byte_at(b, i+1)
+			if d == 110 { o = o + "\n"  i = i + 2  continue }
+			if d == 116 { o = o + "\t"  i = i + 2  continue }
+			if d == 114 { o = o + "\r"  i = i + 2  continue }
+			if d == 34 { o = o + "\""  i = i + 2  continue }
+			if d == 92 { o = o + "\\"  i = i + 2  continue }
+			if d == 47 { o = o + "/"  i = i + 2  continue }
+		}
+		o = o + bytes_str(bytes_sub(b, i, i+1))
+		i = i + 1
+	}
+	return
+}
+
+// concatenate message contents into a completion prompt (base model)
+func build_prompt(body) (text) {
+	text = ""
+	i := 0
+	while i < 256 {
+		content, e := json_get(body, ".messages[" + str(i) + "].content")
+		if len(e) > 0 { break }
+		c := json_str(content)
+		if len(text) > 0 { text = text + "\n" }
+		text = text + c
+		i = i + 1
+	}
+	return
+}
+
+func handle_chat(reqbody) (res) {
+	text := build_prompt(reqbody)
+	max_new := 128
+	mn, me := json_get(reqbody, ".max_tokens")
+	if len(me) == 0 { v := parse_int(mn)  if v > 0 { max_new = v } }
+	ids := tok_encode(text)
+	if len(ids) == 0 { ids = append(ids, 0) }
+	g := <-mu_acq          // acquire single-flight lock
+	out := gen_ids(ids, len(ids), max_new)
+	g = g
+	mu_rel <- 1            // release
+	reply := tok_decode(out)
+	np := len(ids)
+	n := len(out)
+	body := "{\"id\":\"chatcmpl-olmoe\",\"object\":\"chat.completion\",\"created\":0,\"model\":\"" + model_id + "\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"" + json_esc(reply) + "\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":" + str(np) + ",\"completion_tokens\":" + str(n) + ",\"total_tokens\":" + str(np+n) + "}}"
+	res = ok_json(body)
+	return
+}
+
+func api_route(req) (res) {
+	if req.method == "POST" && req.path == "/v1/chat/completions" { res = handle_chat(req.body)  return }
+	if req.method == "GET" && req.path == "/v1/models" { res = ok_json("{\"object\":\"list\",\"data\":[{\"id\":\"" + model_id + "\",\"object\":\"model\",\"owned_by\":\"colibri\"}]}")  return }
+	if req.method == "GET" && req.path == "/health" { res = ok_json("{\"ok\":true,\"model\":\"" + model_id + "\"}")  return }
+	res = ok_json("{\"error\":{\"message\":\"not found\",\"type\":\"invalid_request_error\"}}")
+	return
+}
+
+func main() {
+	a := args()
+	path := "models/olmoe-q8-lm8.bin"
+	port := 8091
+	tokf := "models/olmoe-tok.bin"
+	if len(a) > 1 { path = a[1] }
+	if len(a) > 2 { port = parse_int(a[2]) }
+	if len(a) > 3 { tokf = a[3] }
+	t0 := now_ms()
+	olmoe_init(path)
+	load_tok(tokf)
+	go mutex_srv(mu_acq, mu_rel)
+	println("olmoe serve: " + model_id + " experts=" + str(E) + " (int" + str(ebits) + ", lm_head " + str(lmbits) + ") loaded in " + str(now_ms()-t0) + " ms, " + str(n_workers) + " workers")
+	println("OpenAI-compatible API on http://0.0.0.0:" + str(port) + "/v1")
+	serve(port, func(req) { return api_route(req) })
+}

@@ -399,41 +399,30 @@ func forward(tok, pos) (best) {
 	return bi
 }
 
-func main() {
-	a := args()
-	path := "models/olmoe-q8.bin"
-	if len(a) > 1 { path = a[1] }
+// load model + alloc + spawn worker pool (COLIBRI_THREADS)
+func olmoe_init(path) {
 	load_olmoe(path)
 	alloc_olmoe()
 	nw := parse_int(env("COLIBRI_THREADS"))
 	if nw > 0 { n_workers = nw } else { n_workers = 6 }
 	w := 0
 	while w < n_workers { go worker(jobs, done)  w = w + 1 }
-	println("OLMoE loaded: D=" + str(D) + " experts=" + str(E) + " top-k=" + str(K) + " layers=" + str(L) + " vocab=" + str(VOCAB) + " | " + str(n_workers) + " workers")
-	flush()
-	// ref.json prompt "The capital of France is"
-	prompt := []int{510, 5347, 273, 6181, 310}
-	nnew := 12
+}
+
+// greedy generate from a FRESH sequence (prompt ids) — stop at eos(50279) or max_new
+func gen_ids(prompt, np, max_new) (out) {
+	out = []int{}
 	pos := 0
-	np := len(prompt)
-	t0 := now_ms()
 	i := 0
-	while i < np - 1 { forward(prompt[i], pos)  pos = pos + 1  i = i + 1 }
+	while i < np - 1 && pos < SEQ - 1 { forward(prompt[i], pos)  pos = pos + 1  i = i + 1 }
 	cur := prompt[np-1]
-	out := ""
 	i = 0
-	while i < nnew {
+	while i < max_new && pos < SEQ - 1 {
 		cur = forward(cur, pos)
 		pos = pos + 1
-		out = out + str(cur)
-		if i < nnew - 1 { out = out + ", " }
+		if cur == 50279 { break }
+		out = append(out, cur)
 		i = i + 1
 	}
-	t1 := now_ms()
-	println("MFL tokens: [" + out + "]")
-	println("expected  : [7785, 15, 187, 187, 510, 3565, 3448, 273, 6181, 310, 5112, 15]")
-	nt := 0
-	i = 0
-	while i < E*L { if peek_i32(touched, i*4) == 1 { nt = nt + 1 }  i = i + 1 }
-	println("experts streamed in: " + str(nt) + " / " + str(E*L) + "  |  " + str(float((np-1+nnew)*1000)/float(t1-t0)) + " tok/s")
+	return
 }

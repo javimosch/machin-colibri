@@ -75,6 +75,25 @@ makes the total model size bounded by disk, not RAM. Same pure-MFL engine, same
 `dot_q8` kernel, `mmap_file` streaming. The disruption was in the model, and the
 runtime carries it in pure MFL.
 
+## OpenAI-compatible server (pure MFL, incl. the tokenizer)
+
+`serve_olmoe.src` wraps the engine in an OpenAI-compatible HTTP server, with the
+**OLMoE byte-level BPE tokenizer written in pure MFL** (`olmoe_tok.src`):
+GPT-2/NeoX pretokenizer + ranked-merge BPE, validated `encode("The capital of
+France is") == [510,5347,273,6181,310]` (the exact `ref.json` prompt_ids) and
+decode round-trips. Endpoints: `GET /v1/models`, `GET /health`, `POST
+/v1/chat/completions`; single-flight generation via a mutex-as-service.
+
+Verified end-to-end with **the official `openai` Python client** and `curl`:
+```
+POST /v1/chat/completions  {"messages":[{"role":"user","content":"The capital of France is"}]}
+-> " Paris.\n\nThe capital of the United States is Washington, D.C."
+"Water is made of" -> "Hydrogen is a gas.\n\nOxygen is a"   (base-model completion)
+```
+Load time 31 ms (mmap). Deploy unit: `deploy/olmoe-serve.service`. (OLMoE-0924 is
+a *base* model — completions, not chat-tuned; the Instruct variant would add a
+chat template, same engine.)
+
 ## Reproduce
 ```bash
 # download (13.8 GB bf16)

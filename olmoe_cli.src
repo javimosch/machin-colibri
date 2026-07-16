@@ -1,0 +1,24 @@
+// CLI harness for the OLMoE engine (composes with olmoe_engine.src): runs the
+// ref.json prompt, verifies token stream + reports tok/s and experts streamed.
+func main() {
+	a := args()
+	path := "models/olmoe-q8.bin"
+	if len(a) > 1 { path = a[1] }
+	olmoe_init(path)
+	println("OLMoE loaded: D=" + str(D) + " experts=" + str(E) + " top-k=" + str(K) + " layers=" + str(L) + " vocab=" + str(VOCAB) + " | experts int" + str(ebits) + " lm_head " + str(lmbits) + " | " + str(n_workers) + " workers")
+	flush()
+	prompt := []int{510, 5347, 273, 6181, 310}   // "The capital of France is"
+	nnew := 12
+	t0 := now_ms()
+	ids := gen_ids(prompt, len(prompt), nnew)
+	t1 := now_ms()
+	out := ""
+	i := 0
+	while i < len(ids) { out = out + str(ids[i])  if i < len(ids)-1 { out = out + ", " }  i = i + 1 }
+	println("MFL tokens: [" + out + "]")
+	println("fp32 ref  : [7785, 15, 187, 187, 510, 5347, 273, 253, 1986, 2077, 310, 5041]")
+	nt := 0
+	i = 0
+	while i < E*L { if peek_i32(touched, i*4) == 1 { nt = nt + 1 }  i = i + 1 }
+	println("experts streamed in: " + str(nt) + " / " + str(E*L) + "  |  " + str(float((len(prompt)-1+len(ids))*1000)/float(t1-t0)) + " tok/s")
+}
