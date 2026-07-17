@@ -33,7 +33,7 @@ def wstr(f, s):
 with open(OUT, "wb") as f:
     f.write(struct.pack("<3i", MAGIC, VOCAB_SIZE, len(merges)))
     for t in id2tok: wstr(f, t)
-    for m in merges: wstr(f, m)          # "A B", space-separated
+    for m in merges: wstr(f, m if isinstance(m, str) else " ".join(m))
     for b in range(256): wstr(f, b2u[b]) # byte -> byte-level char (utf-8)
     f.write(bytes(range(256)))           # identity blob: lets MFL emit any raw byte for decode
 print(f"wrote {OUT}: vocab={VOCAB_SIZE} merges={len(merges)} + 256 byte-level chars + id-blob")

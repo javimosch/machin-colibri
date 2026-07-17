@@ -30,3 +30,8 @@ qwen_cli
 serve_qwen.mfl
 serve_qwen
 qwen-hf/
+qwen3.mfl
+qwen3_cli
+serve_qwen3.mfl
+serve_qwen3
+qwen3-hf/

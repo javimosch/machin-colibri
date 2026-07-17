@@ -1,0 +1,253 @@
+// Qwen2.5-1.5B-Instruct OpenAI-compatible server in pure MFL — ChatML template,
+// SSE STREAMING (stream:true, the pi requirement), function calling, idle-release.
+// Build: machin encode framework/machweb.src qwen_engine.src qwen_tok.src serve_qwen.src
+
+var model_id = "qwen3-1.7b"
+var IM_START = 151644
+var IM_END = 151645
+var mu_acq = make(chan int)
+var mu_rel = make(chan int)
+var last_req = 0
+var released = 0
+var idle_ms = 300000
+
+func mutex_srv(acq, rel) {
+	while true {
+		acq <- 1
+		v := <-rel
+		if v < 0 { break }
+	}
+}
+
+func idle_watchdog() {
+	while true {
+		sleep(30000)
+		if idle_ms > 0 && released == 0 && now_ms() - last_req > idle_ms {
+			g := <-mu_acq
+			if released == 0 && now_ms() - last_req > idle_ms {
+				madvise_free(mb, model_bytes)
+				released = 1
+				println("[colibri] idle -> released model pages")  flush()
+			}
+			mu_rel <- 1
+		}
+	}
+}
+
+func json_esc(s) (o) {
+	o = replace(s, "\\", "\\\\")
+	o = replace(o, "\"", "\\\"")
+	o = replace(o, "\n", "\\n")
+	o = replace(o, "\r", "\\r")
+	o = replace(o, "\t", "\\t")
+	return
+}
+
+func json_str(s) (o) {
+	v := s
+	if len(v) >= 2 && has_prefix(v, "\"") && has_suffix(v, "\"") { v = substr(v, 1, len(v)-1) }
+	o = ""
+	b := bytes(v)
+	n := len(b)
+	i := 0
+	while i < n {
+		c := byte_at(b, i)
+		if c == 92 && i+1 < n {
+			d := byte_at(b, i+1)
+			if d == 110 { o = o + "\n"  i = i + 2  continue }
+			if d == 116 { o = o + "\t"  i = i + 2  continue }
+			if d == 114 { o = o + "\r"  i = i + 2  continue }
+			if d == 34 { o = o + "\""  i = i + 2  continue }
+			if d == 92 { o = o + "\\"  i = i + 2  continue }
+			if d == 47 { o = o + "/"  i = i + 2  continue }
+		}
+		o = o + bytes_str(bytes_sub(b, i, i+1))
+		i = i + 1
+	}
+	return
+}
+
+func app_ids(dst, src) (out) {
+	out = dst
+	i := 0
+	while i < len(src) { out = append(out, src[i])  i = i + 1 }
+	return
+}
+
+// build the ChatML token sequence from OpenAI messages (+ tools)
+func build_prompt_ids(body) (ids) {
+	ids = []int{}
+	sys := "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."
+	r0, e0 := json_get(body, ".messages[0].role")
+	first := 0
+	if len(e0) == 0 && json_str(r0) == "system" {
+		c0, _ := json_get(body, ".messages[0].content")
+		sys = json_str(c0)
+		first = 1
+	}
+	// tools -> append signatures + instruction to the system message
+	tools := ""
+	ti := 0
+	while ti < 32 {
+		fn, et := json_get(body, ".tools[" + str(ti) + "].function")
+		if len(et) > 0 { break }
+		if ti > 0 { tools = tools + "\n" }
+		tools = tools + fn
+		ti = ti + 1
+	}
+	if len(tools) > 0 {
+		sys = sys + "\n\n# Tools\n\nYou may call functions. Return the call as JSON wrapped in <tool_call></tool_call>, e.g. <tool_call>{\"name\": <fn>, \"arguments\": <args>}</tool_call>.\n\nFunctions:\n" + tools
+	}
+	ids = append(ids, IM_START)
+	ids = app_ids(ids, tok_encode_raw("system\n" + sys))
+	ids = append(ids, IM_END)
+	ids = app_ids(ids, tok_encode_raw("\n"))
+	i := first
+	while i < 256 {
+		role, er := json_get(body, ".messages[" + str(i) + "].role")
+		if len(er) > 0 { break }
+		content, _ := json_get(body, ".messages[" + str(i) + "].content")
+		rr := json_str(role)
+		cc := json_str(content)
+		if rr == "tool" { rr = "user"  cc = "<tool_response>\n" + cc + "\n</tool_response>" }
+		ids = append(ids, IM_START)
+		ids = app_ids(ids, tok_encode_raw(rr + "\n" + cc))
+		ids = append(ids, IM_END)
+		ids = app_ids(ids, tok_encode_raw("\n"))
+		i = i + 1
+	}
+	ids = append(ids, IM_START)
+	ids = app_ids(ids, tok_encode_raw("assistant\n"))
+	return
+}
+
+func find_tool_call(s) (found, name, argsj) {
+	found = 0  name = ""  argsj = "{}"
+	ni := index(s, "\"name\"")
+	if ni < 0 { return }
+	rest := substr(s, ni+6, len(s))
+	q1 := index(rest, "\"")
+	if q1 < 0 { return }
+	after := substr(rest, q1+1, len(rest))
+	q2 := index(after, "\"")
+	if q2 < 0 { return }
+	name = substr(after, 0, q2)
+	ai := index(s, "\"arguments\"")
+	if ai >= 0 {
+		ar := substr(s, ai+11, len(s))
+		ob := index(ar, "{")
+		if ob >= 0 {
+			depth := 0
+			j := ob
+			b := bytes(ar)
+			while j < len(ar) {
+				c := byte_at(b, j)
+				if c == 123 { depth = depth + 1 }
+				if c == 125 { depth = depth - 1  if depth == 0 { argsj = substr(ar, ob, j+1)  break } }
+				j = j + 1
+			}
+		}
+	}
+	found = 1
+	return
+}
+
+func handle_chat(req) (res) {
+	body := req.body
+	streaming := 0
+	sv, se := json_get(body, ".stream")
+	if len(se) == 0 && sv == "true" { streaming = 1 }
+	has_tools := 0
+	tf, te := json_get(body, ".tools[0]")
+	if len(te) == 0 { has_tools = 1 }
+	tf = tf
+	max_new := 512
+	mn, me := json_get(body, ".max_tokens")
+	if len(me) == 0 { v := parse_int(mn)  if v > 0 { max_new = v } }
+	ids := build_prompt_ids(body)
+	np := len(ids)
+	id := "chatcmpl-qwen"
+
+	// live streaming (no tools): stream tokens as SSE
+	if streaming == 1 && has_tools == 0 {
+		res = sse(func(conn) {
+			g := <-mu_acq
+			last_req = now_ms()
+			released = 0
+			write(conn, "data: {\"id\":\"" + id + "\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"" + model_id + "\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n")
+			gen_stream(ids, np, max_new, func(tid) {
+				piece := tok_decode([]int{tid})
+				write(conn, "data: {\"id\":\"" + id + "\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"" + model_id + "\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"" + json_esc(piece) + "\"},\"finish_reason\":null}]}\n\n")
+			})
+			g = g
+			last_req = now_ms()
+			mu_rel <- 1
+			write(conn, "data: {\"id\":\"" + id + "\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"" + model_id + "\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n")
+			write(conn, "data: [DONE]\n\n")
+		})
+		return
+	}
+
+	// buffered (non-stream, or stream+tools: must see the whole output)
+	g := <-mu_acq
+	last_req = now_ms()
+	released = 0
+	out := gen_stream(ids, np, max_new, func(tid) { tid = tid })
+	g = g
+	last_req = now_ms()
+	mu_rel <- 1
+	reply := tok_decode(out)
+	n := len(out)
+	found, tname, targs := find_tool_call(reply)
+	callid := "call_" + str(np) + str(n)
+
+	if streaming == 1 {
+		res = sse(func(conn) {
+			write(conn, "data: {\"id\":\"" + id + "\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"" + model_id + "\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n")
+			if found == 1 {
+				write(conn, "data: {\"id\":\"" + id + "\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"" + model_id + "\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"" + callid + "\",\"type\":\"function\",\"function\":{\"name\":\"" + json_esc(tname) + "\",\"arguments\":\"" + json_esc(targs) + "\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n")
+			} else {
+				write(conn, "data: {\"id\":\"" + id + "\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"" + model_id + "\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"" + json_esc(reply) + "\"},\"finish_reason\":\"stop\"}]}\n\n")
+			}
+			write(conn, "data: [DONE]\n\n")
+		})
+		return
+	}
+	if found == 1 {
+		b := "{\"id\":\"" + id + "\",\"object\":\"chat.completion\",\"created\":0,\"model\":\"" + model_id + "\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"id\":\"" + callid + "\",\"type\":\"function\",\"function\":{\"name\":\"" + json_esc(tname) + "\",\"arguments\":\"" + json_esc(targs) + "\"}}]},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":" + str(np) + ",\"completion_tokens\":" + str(n) + ",\"total_tokens\":" + str(np+n) + "}}"
+		res = ok_json(b)
+		return
+	}
+	b := "{\"id\":\"" + id + "\",\"object\":\"chat.completion\",\"created\":0,\"model\":\"" + model_id + "\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"" + json_esc(reply) + "\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":" + str(np) + ",\"completion_tokens\":" + str(n) + ",\"total_tokens\":" + str(np+n) + "}}"
+	res = ok_json(b)
+	return
+}
+
+func api_route(req) (res) {
+	if req.method == "POST" && req.path == "/v1/chat/completions" { res = handle_chat(req)  return }
+	if req.method == "GET" && req.path == "/v1/models" { res = ok_json("{\"object\":\"list\",\"data\":[{\"id\":\"" + model_id + "\",\"object\":\"model\",\"owned_by\":\"colibri\"}]}")  return }
+	if req.method == "GET" && req.path == "/health" { res = ok_json("{\"ok\":true,\"model\":\"" + model_id + "\"}")  return }
+	res = ok_json("{\"error\":{\"message\":\"not found\",\"type\":\"invalid_request_error\"}}")
+	return
+}
+
+func main() {
+	a := args()
+	path := "models/qwen3-q8.bin"
+	port := 8094
+	tokf := "models/qwen3-tok.bin"
+	if len(a) > 1 { path = a[1] }
+	if len(a) > 2 { port = parse_int(a[2]) }
+	if len(a) > 3 { tokf = a[3] }
+	t0 := now_ms()
+	qwen_init(path)
+	load_tok(tokf)
+	is := parse_int(env("COLIBRI_IDLE"))
+	if len(env("COLIBRI_IDLE")) > 0 { idle_ms = is * 1000 }
+	last_req = now_ms()
+	go mutex_srv(mu_acq, mu_rel)
+	go idle_watchdog()
+	println("qwen serve: " + model_id + " ctx=" + str(SEQ) + " loaded in " + str(now_ms()-t0) + " ms, " + str(n_workers) + " workers, idle " + str(idle_ms/1000) + "s")
+	println("OpenAI API (streaming) on http://0.0.0.0:" + str(port) + "/v1")
+	serve(port, func(req) { return api_route(req) })
+}
