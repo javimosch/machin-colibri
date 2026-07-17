@@ -545,6 +545,8 @@ func qwen_init(path) {
 	if tl > 0 { pb_tile = tl }
 	if parse_int(env("COLIBRI_NOBATCH")) == 1 { pb_enabled = 0 }
 	load_qwen(path)
+	cx := parse_int(env("COLIBRI_CTX"))    // cap KV cache context (fit RAM); 0 = full model ctx
+	if cx > 0 && cx < SEQ { SEQ = cx }
 	alloc_qwen()
 	nw := parse_int(env("COLIBRI_THREADS"))
 	if nw > 0 { n_workers = nw } else { n_workers = 6 }

@@ -56,6 +56,35 @@ The result is an engine that is **already at the roofline**. What that means, an
 
 This is not a frontier model. It is a **real instruction-tuned LLM answering correctly, fast, with an engine that has no right to be this small** — and a map of exactly where the hardware wall is.
 
+## Benchmarks (measured — rbm21: Intel i5-13400T, 14 threads, AVX-VNNI, DDR4)
+
+All pure MFL, int8, no dependencies. Numbers are real, on a cool box (not thermally throttled).
+
+**Decode throughput**
+
+| model | params (active) | context | tok/s |
+|---|---|---|---|
+| Qwen2.5-1.5B-Instruct | 1.5B | 32k | **11.7** |
+| Qwen3-1.7B (thinking) | 1.7B | 40k | **12.7** |
+| OLMoE-1B-7B (MoE) | 6.9B (1.3B) | 4k | 14.5¹ |
+
+**Prefill** — the [`matmul_q8_batch`](https://github.com/javimosch/machin) builtin (contributed to machin core) vs a per-token loop:
+
+| prompt tokens | per-token | **batched** | speedup |
+|---|---|---|---|
+| 256 | 15.2 s | **7.5 s** | 2.0× |
+| 512 | 30.8 s | **15.2 s** | 2.0× |
+| 1024 | 64.8 s | **31.4 s** | 2.1× |
+
+**Prefix cache** — a repeated system prompt (the agentic-client pattern), end-to-end from a laptop over the network to rbm21, ~600-token system prompt:
+
+| | latency |
+|---|---|
+| cold (first turn) | 9.5 s |
+| warm (prefix cache) | **0.7 s** (13× — only the delta re-prefills) |
+
+Every model above is **token-identical to its fp32 numpy reference** (int8 quantization did not change the greedy output). ¹OLMoE measured on the laptop.
+
 ## Quick start
 
 ```bash
@@ -141,6 +170,10 @@ ChatML + function-calling — so agentic clients that require streaming work.
 Discovery: on a 152k-token vocab, the tied **fp32** lm_head cost 933 MB/token
 (decode 3.6 tok/s); quantizing it to int8 → **7.8 tok/s** (2.2×), still
 token-identical.
+
+And **Qwen3-1.7B** — the newer generation, **40k context**, **thinking-capable**,
+adds **per-head qk-norm** (reused from the OLMoE engine) to the same GQA + tied-embed
+engine. 12.7 tok/s on rbm21. See [certs/M10-qwen3.md](certs/M10-qwen3.md).
 
 ## Also: a function-calling agent model (xLAM-1b-fc-r)
 
