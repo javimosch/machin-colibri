@@ -5,6 +5,7 @@
 var model_id = "qwen3-1.7b"
 var IM_START = 151644
 var IM_END = 151645
+var nothink = 0   // COLIBRI_NOTHINK=1: prime an empty <think></think> so Qwen3 skips reasoning
 var mu_acq = make(chan int)
 var mu_rel = make(chan int)
 var last_req = 0
@@ -118,6 +119,12 @@ func build_prompt_ids(body) (ids) {
 	}
 	ids = append(ids, IM_START)
 	ids = app_ids(ids, tok_encode_raw("assistant\n"))
+	if nothink == 1 {              // empty <think>\n\n</think>\n\n -> model answers directly
+		ids = append(ids, 151667)
+		ids = append(ids, 271)
+		ids = append(ids, 151668)
+		ids = append(ids, 271)
+	}
 	return
 }
 
@@ -244,6 +251,7 @@ func main() {
 	load_tok(tokf)
 	is := parse_int(env("COLIBRI_IDLE"))
 	if len(env("COLIBRI_IDLE")) > 0 { idle_ms = is * 1000 }
+	if parse_int(env("COLIBRI_NOTHINK")) == 1 { nothink = 1 }
 	last_req = now_ms()
 	go mutex_srv(mu_acq, mu_rel)
 	go idle_watchdog()
