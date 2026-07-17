@@ -83,6 +83,37 @@ Validated across processes: run 1 warmed 200 tok + saved; run 2 (fresh process)
 8k-ctx rbm21 deploy the snapshot is ~1.9 GB (`k`+`v`), loaded in a few seconds vs
 the 144 s boot warm. So a redeploy/reboot no longer re-pays the prefill.
 
+### Normalizing pi's per-request date (the real per-turn fix)
+
+Warming the system prompt made the *first* turn fast, but pi still timed out on
+*every* turn. Root cause, found in pi's `system-prompt.js`:
+
+```js
+// Add date and working directory last
+prompt += `\nCurrent date: ${date}`;
+prompt += `\nCurrent working directory: ${promptCwd}`;
+```
+
+pi appends a **fresh timestamp** to the end of the system prompt on every request.
+That timestamp sits *right before the conversation* (the stable instructions end at
+~2358 tokens, then the date, then the chat). Because the date changes each turn, the
+prefix cache diverges at token ~2358 **every turn** — so the entire growing
+conversation re-prefills each turn (852-token prefill measured on a mid-length chat →
+exceeds pi's client timeout → "Error: Request timed out" then the retry answers off
+the now-populated cache). The boot warm can't help: it only covers the stable head.
+
+Fix: **normalize the date server-side.** `build_prompt_ids` rewrites
+`Current date: <timestamp>` → a fixed `Current date: 2026-01-01T00:00:00.000Z`
+before tokenizing (`norm_date`). The prompt is now byte-stable across turns, so the
+full conversation caches and each turn prefills **only the new user message**. The
+cwd line is left as-is (stable per session). Trade-off: the model sees a fixed date
+(irrelevant for a coding agent). Deployed on `qwen3.service`.
+
+Diagnostic recipe (reusable for any agentic client): `COLIBRI_LOGPROMPT=1`, capture
+two consecutive real requests, diff their token ids — the **common-prefix length** is
+exactly where the client injects per-request dynamic content. Warm up to there and, if
+that dynamic field precedes the conversation, normalize it.
+
 ## Deploy
 `serve_qwen3` on rbm21 (`qwen3.service`, :8094, `COLIBRI_CTX=8192`,
 `COLIBRI_IDLE=600`). Build: `machin encode $MACHIN/framework/machweb.src

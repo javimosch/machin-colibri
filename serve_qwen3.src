@@ -77,6 +77,23 @@ func app_ids(dst, src) (out) {
 }
 
 // build the ChatML token sequence from OpenAI messages (+ tools)
+// pi appends "Current date: <timestamp>" to the end of its system prompt, and the
+// timestamp changes every request -> it breaks the prefix cache right before the
+// conversation, forcing the whole (growing) conversation to re-prefill each turn.
+// Pin the date to a fixed value so the entire prompt caches; every turn then only
+// prefills the new user message. (The cwd line is stable per session, kept as-is.)
+func norm_date(s) (out) {
+	out = s
+	di := index(s, "Current date:")
+	if di < 0 { return }
+	rest := substr(s, di+13, len(s))
+	nl := index(rest, "\n")
+	tail := ""
+	if nl >= 0 { tail = substr(rest, nl, len(rest)) }
+	out = substr(s, 0, di) + "Current date: 2026-01-01T00:00:00.000Z" + tail
+	return
+}
+
 func build_prompt_ids(body) (ids) {
 	ids = []int{}
 	sys := "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."
@@ -84,7 +101,7 @@ func build_prompt_ids(body) (ids) {
 	first := 0
 	if len(e0) == 0 && json_str(r0) == "system" {
 		c0, _ := json_get(body, ".messages[0].content")
-		sys = json_str(c0)
+		sys = norm_date(json_str(c0))
 		first = 1
 	}
 	// tools -> append signatures + instruction to the system message
