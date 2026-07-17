@@ -585,6 +585,41 @@ func gen_stream(prompt, np, max_new, emit) (out) {
 	return
 }
 
+// persist the warmed KV cache to disk (kcache/vcache buffers + a meta of the
+// prefix ids) so a restart can skip the boot prefill. base -> base.k/.v/.meta
+func save_kv(base) {
+	kb2 := L*SEQ*KV*4
+	write_file_raw(base + ".k", kcache, kb2)
+	write_file_raw(base + ".v", vcache, kb2)
+	meta := alloc((4 + cache_len) * 4)
+	poke_i32(meta, 0, cache_len)  poke_i32(meta, 4, L)  poke_i32(meta, 8, SEQ)  poke_i32(meta, 12, KV)
+	i := 0
+	while i < cache_len { poke_i32(meta, (4+i)*4, peek_i32(cache_buf, i*4))  i = i + 1 }
+	write_file_raw(base + ".meta", meta, (4 + cache_len)*4)
+	free(meta)
+}
+
+// load a saved KV snapshot IFF it matches the current prefix ids + dims.
+func load_kv(base, wids, wn) (ok) {
+	ok = 0
+	meta := alloc((4 + wn) * 4)
+	rm := read_file_raw(base + ".meta", meta, (4 + wn)*4)
+	if rm < 16 { free(meta)  return }
+	cl := peek_i32(meta, 0)
+	if peek_i32(meta, 4) != L || peek_i32(meta, 8) != SEQ || peek_i32(meta, 12) != KV || cl != wn { free(meta)  return }
+	i := 0
+	while i < cl { if peek_i32(meta, (4+i)*4) != wids[i] { free(meta)  return }  i = i + 1 }
+	free(meta)
+	kb2 := L*SEQ*KV*4
+	if read_file_raw(base + ".k", kcache, kb2) < 1 { return }
+	if read_file_raw(base + ".v", vcache, kb2) < 1 { return }
+	i = 0
+	while i < cl { poke_i32(cache_buf, i*4, wids[i])  i = i + 1 }
+	cache_len = cl
+	ok = 1
+	return
+}
+
 // warm the prefix cache: prefill `prompt` into KV without generating, so later
 // requests sharing this prefix skip it entirely. For a fixed agentic system
 // prompt, call this once at boot -> every request (incl. the first) is warm.

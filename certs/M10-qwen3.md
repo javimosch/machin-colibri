@@ -64,8 +64,24 @@ gen after warm (only 3-token delta) :     623 ms   <- EVERY request now pays thi
 So the fixed system-prompt cost is amortized to a **one-time boot prefill**, and
 every pi turn's first token drops from ~13 s to ~0.6 s (only the user delta). This
 is the disruption for agentic-client-on-CPU: decouple the constant prompt from
-per-request latency. (Next step: persist the warmed KV to disk so even a restart
-skips the boot prefill.)
+per-request latency.
+
+### Persisting the warmed KV to disk (COLIBRI_KVSTORE)
+
+The boot warm is a one-time ~2.4 min cost — but a *restart* re-pays it. So the
+warmed KV is now **serialized to disk** and reloaded on the next boot:
+
+- `save_kv(base)` / `load_kv(base, ids, n)` (engine) — dump/restore the
+  `kcache`/`vcache` buffers + a meta (`cache_len` + prefix ids + dims) via the
+  machin-core `write_file_raw`/`read_file_raw` builtins (machin PR #478).
+- `COLIBRI_KVSTORE=<base>` (server) — on boot: if a snapshot exists and its ids +
+  dims match the current `COLIBRI_WARM` prefix, **load it (ms)** and skip the
+  prefill; else warm (once) and save the snapshot.
+
+Validated across processes: run 1 warmed 200 tok + saved; run 2 (fresh process)
+**`load_kv` = 80 ms** (vs ~12 s to re-warm), then delta-only gen 578 ms. On the
+8k-ctx rbm21 deploy the snapshot is ~1.9 GB (`k`+`v`), loaded in a few seconds vs
+the 144 s boot warm. So a redeploy/reboot no longer re-pays the prefill.
 
 ## Deploy
 `serve_qwen3` on rbm21 (`qwen3.service`, :8094, `COLIBRI_CTX=8192`,

@@ -261,7 +261,8 @@ func main() {
 	if len(env("COLIBRI_IDLE")) > 0 { idle_ms = is * 1000 }
 	if parse_int(env("COLIBRI_NOTHINK")) == 1 { nothink = 1 }
 	if parse_int(env("COLIBRI_LOGPROMPT")) == 1 { logprompt = 1 }
-	wf := env("COLIBRI_WARM")   // file of comma-sep prompt token ids to preload into the KV cache
+	wf := env("COLIBRI_WARM")     // file of comma-sep prompt token ids to preload into the KV cache
+	kvs := env("COLIBRI_KVSTORE") // optional: persist/restore the warmed KV (base path -> .k/.v/.meta)
 	if len(wf) > 0 {
 		wb := read_file_bytes(wf)
 		if len(wb) > 0 {
@@ -270,9 +271,18 @@ func main() {
 			k := 0
 			while k < len(parts) { v := parse_int(parts[k])  if v >= 0 { wids = append(wids, v) }  k = k + 1 }
 			if len(wids) > 0 {
-				t1 := now_ms()
-				warm(wids, len(wids))
-				println("warmed " + str(len(wids)) + "-token prefix in " + str(now_ms()-t1) + " ms (every request now reuses it)")
+				loaded := 0
+				if len(kvs) > 0 {
+					t0 := now_ms()
+					loaded = load_kv(kvs, wids, len(wids))
+					if loaded == 1 { println("loaded warmed KV (" + str(len(wids)) + " tok) from " + kvs + " in " + str(now_ms()-t0) + " ms (skipped boot prefill)") }
+				}
+				if loaded == 0 {
+					t1 := now_ms()
+					warm(wids, len(wids))
+					println("warmed " + str(len(wids)) + "-token prefix in " + str(now_ms()-t1) + " ms")
+					if len(kvs) > 0 { save_kv(kvs)  println("persisted warmed KV to " + kvs + " (next restart loads it)") }
+				}
 			}
 		}
 	}
