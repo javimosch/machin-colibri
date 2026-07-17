@@ -40,6 +40,33 @@ a reasoning trace by default (controllable via the chat template's
 now points there. The streaming server (SSE), ChatML, and function-calling all
 carry over from the Qwen2.5 server.
 
+## Disruption: warm the fixed system prompt once (COLIBRI_WARM)
+
+An agentic client (pi) resends the **same** multi-thousand-token system prompt on
+every turn. The prefix cache already skips it *within* a process, but the **first**
+turn of every server lifetime still pays the full cold prefill (~1–2 min). The
+fix: **preload the system prompt's KV at boot** so *every* request — including the
+first — only prefills the small user delta.
+
+- `warm(prompt, np)` (engine) — batched-prefill a prefix into the KV cache and set
+  `cache_buf`/`cache_len`, without generating.
+- `COLIBRI_WARM=<file>` (server) — a file of comma-separated prompt token ids;
+  preloaded at boot.
+- `COLIBRI_LOGPROMPT=1` — `println`s each request's prompt ids, to capture pi's
+  actual system prompt once (then feed it to `COLIBRI_WARM`).
+
+Measured (local, throttled — relative comparison holds):
+```
+cold gen (203-token prefill)        : 12,873 ms
+warm the prefix once (200 tok, boot):  12,422 ms   <- one-time
+gen after warm (only 3-token delta) :     623 ms   <- EVERY request now pays this
+```
+So the fixed system-prompt cost is amortized to a **one-time boot prefill**, and
+every pi turn's first token drops from ~13 s to ~0.6 s (only the user delta). This
+is the disruption for agentic-client-on-CPU: decouple the constant prompt from
+per-request latency. (Next step: persist the warmed KV to disk so even a restart
+skips the boot prefill.)
+
 ## Deploy
 `serve_qwen3` on rbm21 (`qwen3.service`, :8094, `COLIBRI_CTX=8192`,
 `COLIBRI_IDLE=600`). Build: `machin encode $MACHIN/framework/machweb.src

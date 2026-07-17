@@ -585,6 +585,23 @@ func gen_stream(prompt, np, max_new, emit) (out) {
 	return
 }
 
+// warm the prefix cache: prefill `prompt` into KV without generating, so later
+// requests sharing this prefix skip it entirely. For a fixed agentic system
+// prompt, call this once at boot -> every request (incl. the first) is warm.
+func warm(prompt, np) {
+	if np > SEQ - 2 { np = SEQ - 2 }
+	if np < 1 { return }
+	if np >= 16 && pb_enabled == 1 {
+		prefill_batch(prompt, 0, np)
+	} else {
+		pos := 0
+		while pos < np { forward(prompt[pos], pos)  pos = pos + 1 }
+	}
+	i := 0
+	while i < np { poke_i32(cache_buf, i*4, prompt[i])  i = i + 1 }
+	cache_len = np
+}
+
 func gen_ids(prompt, np, max_new) (out) {
 	out = gen_stream(prompt, np, max_new, func(tid) { tid = tid })
 	return

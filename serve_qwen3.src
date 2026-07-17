@@ -6,6 +6,7 @@ var model_id = "qwen3-1.7b"
 var IM_START = 151644
 var IM_END = 151645
 var nothink = 0   // COLIBRI_NOTHINK=1: prime an empty <think></think> so Qwen3 skips reasoning
+var logprompt = 0 // COLIBRI_LOGPROMPT=1: println each request's prompt ids (to capture pi's system prompt)
 var mu_acq = make(chan int)
 var mu_rel = make(chan int)
 var last_req = 0
@@ -173,6 +174,13 @@ func handle_chat(req) (res) {
 	if len(me) == 0 { v := parse_int(mn)  if v > 0 { max_new = v } }
 	ids := build_prompt_ids(body)
 	np := len(ids)
+	if logprompt == 1 {
+		s := ""
+		k := 0
+		while k < len(ids) { s = s + str(ids[k])  if k < len(ids)-1 { s = s + "," }  k = k + 1 }
+		println("PROMPTIDS " + str(np) + ": " + s)
+		flush()
+	}
 	id := "chatcmpl-qwen"
 
 	// live streaming (no tools): stream tokens as SSE
@@ -252,6 +260,22 @@ func main() {
 	is := parse_int(env("COLIBRI_IDLE"))
 	if len(env("COLIBRI_IDLE")) > 0 { idle_ms = is * 1000 }
 	if parse_int(env("COLIBRI_NOTHINK")) == 1 { nothink = 1 }
+	if parse_int(env("COLIBRI_LOGPROMPT")) == 1 { logprompt = 1 }
+	wf := env("COLIBRI_WARM")   // file of comma-sep prompt token ids to preload into the KV cache
+	if len(wf) > 0 {
+		wb := read_file_bytes(wf)
+		if len(wb) > 0 {
+			parts := split(bytes_str(wb), ",")
+			wids := []int{}
+			k := 0
+			while k < len(parts) { v := parse_int(parts[k])  if v >= 0 { wids = append(wids, v) }  k = k + 1 }
+			if len(wids) > 0 {
+				t1 := now_ms()
+				warm(wids, len(wids))
+				println("warmed " + str(len(wids)) + "-token prefix in " + str(now_ms()-t1) + " ms (every request now reuses it)")
+			}
+		}
+	}
 	last_req = now_ms()
 	go mutex_srv(mu_acq, mu_rel)
 	go idle_watchdog()
