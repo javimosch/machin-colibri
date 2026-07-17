@@ -264,21 +264,18 @@ func matmul_q8(dst, wq, ws, bias, x, out, inn) {
 	barrier()
 }
 
-// batched matmul with optional per-row bias
+// batched matmul via the machin core builtin (weight row loaded once, reused
+// across B positions) + optional per-row bias added after.
 func matmul_q_batch(ob, ostride, xqb2, xsb2, wq, ws, bias, n, lo, hi, B) {
-	nsc := (n / GS) * 4
-	i := lo
-	while i < hi {
-		wrow := wq + i*n
-		wsp := ws + (i*(n/GS))*4
-		bv := 0.0
-		if bias > 0 { bv = peek_f32(bias, i*4) }
-		b := 0
-		while b < B {
-			poke_f32(ob, (b*ostride + i)*4, dot_q8(xqb2 + b*n, xsb2 + b*nsc, wrow, wsp, n, GS) + bv)
-			b = b + 1
+	matmul_q8_batch(ob, ostride, xqb2, xsb2, wq, ws, n, GS, B, lo, hi)
+	if bias > 0 {
+		i := lo
+		while i < hi {
+			bv := peek_f32(bias, i*4)
+			b := 0
+			while b < B { poke_f32(ob, (b*ostride + i)*4, peek_f32(ob, (b*ostride + i)*4) + bv)  b = b + 1 }
+			i = i + 1
 		}
-		i = i + 1
 	}
 }
 

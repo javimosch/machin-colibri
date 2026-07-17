@@ -59,6 +59,33 @@ streaming   : SSE deltas  {role} -> "Hello" -> "!" -> {finish_reason:"stop"} -> 
 tools       : "weather in Tokyo?" -> tool_calls: get_weather({"city":"Tokyo"})  (finish_reason:tool_calls)
 ```
 
+## Prefill speed: the `matmul_q8_batch` builtin + a real CPU (rbm21)
+
+The laptop couldn't prefill pi's large prompt in time (and was thermally throttled
+to ~half speed at 91°C). Two fixes landed:
+
+1. **`matmul_q8_batch`** (machin core, PR #474) — a batched-matmul builtin: one C
+   call does B positions × a weight-row range with the weight read once, instead
+   of B×rows MFL-level `dot_q8` calls. Clean **2.0–2.1× prefill** (token-identical).
+2. **Run it on rbm21** (i5-13400T, AVX-VNNI, 14 threads, cool) instead of the
+   throttled laptop — ~10× faster.
+
+Measured prefill (rbm21, builtin, 14 threads):
+
+| prompt tokens | per-token | batched (builtin) |
+|---|---|---|
+| 256 | 15.2 s | **7.5 s** |
+| 1024 | 64.8 s | **31.4 s** |
+
+**End-to-end from the laptop → rbm21** with a ~600-token system prompt (this is
+what makes pi practical):
+```
+req1 (cold)             : TTFB 8.9 s, total 9.5 s
+req2 (warm prefix cache): TTFB 0.2 s, total 0.7 s   (13x — only the delta prefills)
+```
+So on rbm21 the first agentic turn is seconds, and every turn after is
+sub-second. pi's provider `qwen` now points at rbm21 (`100.123.0.125:8093`).
+
 ## Speed / footprint / deploy
 7.8 tok/s (8 threads, warm), 1.64 GB int8, 32k context, KV 1.9 GB fp32 at full
 32k. Batched prefill + KV prefix cache carried over (multi-turn agentic loops
