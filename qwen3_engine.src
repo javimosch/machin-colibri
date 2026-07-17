@@ -64,6 +64,25 @@ var pb_tile = 256
 var pb_enabled = 1
 var pb_B = 0
 var pb_tstart = 0
+
+// ---- speculative decode (prompt-lookup / n-gram draft, greedy verify) ----
+// The target decodes greedily (argmax), so greedy speculative decode is
+// byte-identical to plain decode -- a pure, correctness-preserving speedup.
+var spec_k = 0            // draft width; 0 = disabled (COLIBRI_SPEC)
+var spec_ng = 3           // n-gram key length for prompt-lookup
+var SPEC_MAX = 16
+var spec_logits = 0       // (SPEC_MAX+1) * VOCAB floats: batched verify logits
+var spec_seq = 0          // full token sequence (prompt+generated) for lookup
+var spec_slen = 0
+var spec_dbuf = 0         // (SPEC_MAX+1) ints: [cur, draft0..draftK-1] verify inputs
+var spec_pred = 0         // (SPEC_MAX+1) ints: target argmax per verify position
+var spec_st_steps = 0     // instrumentation: verify calls, tokens drafted, accepted
+var spec_st_draft = 0
+var spec_st_accept = 0
+var spec_t_fwd = 0
+var spec_t_lm = 0
+var spec_t_arg = 0
+var spec_stats = 0
 var pb_x = 0
 var pb_xb = 0
 var pb_xb2 = 0
@@ -125,6 +144,8 @@ func alloc_qwen() {
 	pb_hb = alloc(t*II*4)  pb_hb2 = alloc(t*II*4)
 	pb_xq = alloc(t*D)  pb_xqs = alloc(t*(D/GS)*4)
 	pb_hq = alloc(t*II)  pb_hqs = alloc(t*(II/GS)*4)
+	spec_logits = alloc((SPEC_MAX+1)*VOCAB*4)  spec_seq = alloc(SEQ*4)
+	spec_dbuf = alloc((SPEC_MAX+1)*4)  spec_pred = alloc((SPEC_MAX+1)*4)
 	lnth := log(float(theta))
 	i := 0
 	while i < HALF {
@@ -243,6 +264,31 @@ func do_job(j, att2) {
 	}
 	if t == 24 { b := lo  while b < hi { i := 0  while i < D { poke_f32(pb_x + b*D*4, i*4, peek_f32(pb_x + b*D*4, i*4) + peek_f32(pb_xb + b*D*4, i*4))  i = i + 1 }  b = b + 1 } }
 	if t == 25 { b := lo  while b < hi { rope_at(l, pb_tstart + b, pb_q + b*D*4)  b = b + 1 } }
+	if t == 26 {   // batched tied lm_head, TRANSPOSED output spec_logits[i*B + b]: embed row read
+		nsc := D / GS   // once (hot in L1) + B contiguous writes per row (no scattered stride-VOCAB writes)
+		i := lo
+		while i < hi {
+			wq := mb + embed_off + i*D
+			ws := mb + embed_soff + i*nsc*4
+			b := 0
+			while b < pb_B {
+				poke_f32(spec_logits, (i*pb_B + b)*4, dot_q8(pb_xq + b*D, pb_xqs + b*nsc*4, wq, ws, D, GS))
+				b = b + 1
+			}
+			i = i + 1
+		}
+	}
+	if t == 27 {   // parallel per-position argmax over spec_logits[i*B + b] (stride B)
+		b := lo
+		while b < hi {
+			bi := 0
+			bv := peek_f32(spec_logits, b*4)
+			i := 1
+			while i < VOCAB { v := peek_f32(spec_logits, (i*pb_B + b)*4)  if v > bv { bv = v  bi = i }  i = i + 1 }
+			poke_i32(spec_pred, b*4, bi)
+			b = b + 1
+		}
+	}
 }
 
 func worker(jc, dc) {
@@ -548,10 +594,75 @@ func qwen_init(path) {
 	cx := parse_int(env("COLIBRI_CTX"))    // cap KV cache context (fit RAM); 0 = full model ctx
 	if cx > 0 && cx < SEQ { SEQ = cx }
 	alloc_qwen()
+	sk := parse_int(env("COLIBRI_SPEC"))   // speculative draft width (0 = off)
+	if sk > 0 { spec_k = sk  if spec_k > SPEC_MAX { spec_k = SPEC_MAX } }
+	sn := parse_int(env("COLIBRI_SPEC_NG"))
+	if sn > 0 { spec_ng = sn }
+	if parse_int(env("COLIBRI_SPEC_STATS")) == 1 { spec_stats = 1 }
 	nw := parse_int(env("COLIBRI_THREADS"))
 	if nw > 0 { n_workers = nw } else { n_workers = 6 }
 	w := 0
 	while w < n_workers { go worker(jobs, done)  w = w + 1 }
+}
+
+// prompt-lookup draft: key = [spec_seq[pos-ng+1..pos-1], cur]; find its most recent
+// earlier occurrence in spec_seq and propose the tokens that followed. Fills
+// spec_dbuf[1..k] with the draft (spec_dbuf[0]=cur is set by the caller). k tokens.
+func spec_draft(cur, pos) (k) {
+	k = 0
+	if pos < spec_ng { return }
+	cap := spec_k
+	if pos + cap + 2 >= SEQ { cap = SEQ - pos - 2 }
+	if cap < 1 { return }
+	p := pos - spec_ng
+	while p >= 0 {
+		match := 1
+		j := 0
+		while j < spec_ng {
+			kj := cur
+			if j < spec_ng - 1 { kj = peek_i32(spec_seq, (pos - spec_ng + 1 + j)*4) }
+			if peek_i32(spec_seq, (p+j)*4) != kj { match = 0  break }
+			j = j + 1
+		}
+		if match == 1 {
+			src := p + spec_ng
+			while k < cap && src < pos {
+				poke_i32(spec_dbuf, (k+1)*4, peek_i32(spec_seq, src*4))
+				k = k + 1
+				src = src + 1
+			}
+			return
+		}
+		p = p - 1
+	}
+	return
+}
+
+// batched greedy verify: run the target over B positions [pos..pos+B-1] with inputs
+// spec_dbuf[0..B-1] (causal, reuses KV[0..pos-1], fills KV[pos..pos+B-1]); write the
+// per-position argmax into spec_pred[0..B-1]. spec_pred[j] = target's next token given
+// prefix ending at input j -> compare vs spec_dbuf[j+1] to accept.
+func spec_verify(B, pos) {
+	pb_tstart = pos
+	pb_B = B
+	b := 0
+	while b < B { embed_to(peek_i32(spec_dbuf, b*4), pb_x + b*D*4)  b = b + 1 }
+	ta := now_ms()
+	batch_layers(B)
+	tb := now_ms()
+	b = 0
+	while b < B {
+		rmsnorm(pb_xb + b*D*4, pb_x + b*D*4, fnorm_off, D)
+		quantize_act(pb_xq + b*D, pb_xqs + b*(D/GS)*4, pb_xb + b*D*4, D)
+		b = b + 1
+	}
+	dispatch_rows(26, 0, 0, VOCAB)  barrier()   // batched lm_head
+	tc := now_ms()
+	dispatch_rows(27, 0, 0, B)  barrier()       // parallel per-position argmax -> spec_pred
+	td := now_ms()
+	spec_t_fwd = spec_t_fwd + (tb - ta)
+	spec_t_lm = spec_t_lm + (tc - tb)
+	spec_t_arg = spec_t_arg + (td - tc)
 }
 
 // greedy generate with prefix cache + batched prefill; emit(token) streams pieces
@@ -570,18 +681,52 @@ func gen_stream(prompt, np, max_new, emit) (out) {
 		cur = forward(prompt[np-1], np-1)
 	}
 	i := 0
-	while i < np { poke_i32(cache_buf, i*4, prompt[i])  i = i + 1 }
+	while i < np { poke_i32(cache_buf, i*4, prompt[i])  poke_i32(spec_seq, i*4, prompt[i])  i = i + 1 }
 	cache_len = np
+	spec_slen = np
 	pos := np
-	i = 0
-	while i < max_new && pos < SEQ - 1 {
+	produced := 0
+	while produced < max_new && pos < SEQ - 1 {
 		if cur == 151645 || cur == 151643 { break }   // <|im_end|> / <|endoftext|>
-		out = append(out, cur)
-		emit(cur)
-		cur = forward(cur, pos)
-		pos = pos + 1
-		i = i + 1
+		k := 0
+		if spec_k > 0 { poke_i32(spec_dbuf, 0, cur)  k = spec_draft(cur, pos) }
+		if k == 0 {
+			out = append(out, cur)
+			emit(cur)
+			poke_i32(spec_seq, pos*4, cur)
+			spec_slen = pos + 1
+			cur = forward(cur, pos)
+			pos = pos + 1
+			produced = produced + 1
+		} else {
+			spec_verify(k + 1, pos)          // fills KV[pos..pos+k], spec_pred[0..k]
+			m := 0                            // longest accepted draft prefix
+			while m < k {
+				if peek_i32(spec_dbuf, (m+1)*4) != peek_i32(spec_pred, m*4) { break }
+				m = m + 1
+			}
+			spec_st_steps = spec_st_steps + 1
+			spec_st_draft = spec_st_draft + k
+			spec_st_accept = spec_st_accept + m
+			stop := 0                         // emit confirmed run [cur, draft0..draft(m-1)]
+			j := 0
+			while j <= m {
+				tk := peek_i32(spec_dbuf, j*4)
+				if tk == 151645 || tk == 151643 { stop = 1  break }
+				if produced >= max_new { stop = 1  break }
+				out = append(out, tk)
+				emit(tk)
+				poke_i32(spec_seq, (pos+j)*4, tk)
+				produced = produced + 1
+				j = j + 1
+			}
+			spec_slen = pos + j
+			if stop == 1 { break }
+			cur = peek_i32(spec_pred, m*4)   // correction = target argmax at divergence (free token)
+			pos = pos + m + 1
+		}
 	}
+	if spec_k > 0 && spec_stats == 1 { println("SPEC stats: steps=" + str(spec_st_steps) + " drafted=" + str(spec_st_draft) + " accepted=" + str(spec_st_accept) + " produced=" + str(produced) + " | fwd=" + str(spec_t_fwd) + "ms lm=" + str(spec_t_lm) + "ms arg=" + str(spec_t_arg) + "ms")  flush() }
 	return
 }
 
