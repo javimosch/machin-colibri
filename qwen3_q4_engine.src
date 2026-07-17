@@ -19,6 +19,7 @@ var KV = 0
 var KVMUL = 0
 var HALF = 0
 var qblk = 0
+var QD = 0        // NH*HD (attention inner dim; == D only when head_dim*heads == hidden)
 var kvblk = 0
 var attn_stride = 0
 var gu = 0
@@ -120,7 +121,8 @@ func load_qwen(path) {
 	KVMUL = NH / NKV
 	HALF = HD / 2
 	embed_soff = embed_off + VOCAB*D/2   // int8 embed scales (tied lm_head)
-	qblk = D*D/2 + 4*((D*D)/GS)
+	QD = NH * HD
+	qblk = QD*D/2 + 4*((QD*D)/GS)
 	kvblk = KV*D/2 + 4*((KV*D)/GS)
 	attn_stride = 2*qblk + 2*kvblk
 	gu = II*D/2 + 4*((II*D)/GS)
@@ -129,8 +131,8 @@ func load_qwen(path) {
 }
 
 func alloc_qwen() {
-	xx = alloc(D*4)  hb = alloc(D*4)  qb = alloc(D*4)  kb = alloc(KV*4)  vb = alloc(KV*4)
-	attn = alloc(D*4)  ffn_out = alloc(D*4)
+	xx = alloc(D*4)  hb = alloc(D*4)  qb = alloc(QD*4)  kb = alloc(KV*4)  vb = alloc(KV*4)
+	attn = alloc(QD*4)  ffn_out = alloc(D*4)
 	gbuf = alloc(II*4)  ubuf = alloc(II*4)
 	mx := D
 	if II > mx { mx = II }
@@ -140,9 +142,9 @@ func alloc_qwen() {
 	rinv = alloc(HALF*4)  rcos = alloc(HALF*4)  rsin = alloc(HALF*4)
 	cache_buf = alloc(SEQ*4)
 	t := pb_tile
-	pb_x = alloc(t*D*4)  pb_xb = alloc(t*D*4)  pb_xb2 = alloc(t*D*4)  pb_q = alloc(t*D*4)
+	pb_x = alloc(t*D*4)  pb_xb = alloc(t*QD*4)  pb_xb2 = alloc(t*D*4)  pb_q = alloc(t*QD*4)
 	pb_hb = alloc(t*II*4)  pb_hb2 = alloc(t*II*4)
-	pb_xq = alloc(t*D)  pb_xqs = alloc(t*(D/GS)*4)
+	pb_xq = alloc(t*QD)  pb_xqs = alloc(t*(QD/GS)*4)
 	pb_hq = alloc(t*II)  pb_hqs = alloc(t*(II/GS)*4)
 	spec_logits = alloc((SPEC_MAX+1)*VOCAB*4)  spec_seq = alloc(SEQ*4)
 	spec_dbuf = alloc((SPEC_MAX+1)*4)  spec_pred = alloc((SPEC_MAX+1)*4)
@@ -228,10 +230,10 @@ func do_job(j, att2) {
 		while h < hi { attn_head(l, pos, h, att2)  h = h + 1 }
 	}
 	// ---- batched prefill ----
-	if t == 11 { ab := attn_off + l*attn_stride  matmul_q_batch(pb_q, D, pb_xq, pb_xqs, mb + ab, mb + ab + D*D/2, 0, D, lo, hi, pb_B) }
+	if t == 11 { ab := attn_off + l*attn_stride  matmul_q_batch(pb_q, QD, pb_xq, pb_xqs, mb + ab, mb + ab + QD*D/2, 0, D, lo, hi, pb_B) }
 	if t == 12 { ab := attn_off + l*attn_stride  matmul_q_batch(kcache + (l*SEQ*KV + pb_tstart*KV)*4, KV, pb_xq, pb_xqs, mb + ab + qblk, mb + ab + qblk + KV*D/2, 0, D, lo, hi, pb_B) }
 	if t == 13 { ab := attn_off + l*attn_stride  matmul_q_batch(vcache + (l*SEQ*KV + pb_tstart*KV)*4, KV, pb_xq, pb_xqs, mb + ab + qblk + kvblk, mb + ab + qblk + kvblk + KV*D/2, 0, D, lo, hi, pb_B) }
-	if t == 14 { ab := attn_off + l*attn_stride  matmul_q_batch(pb_xb2, D, pb_xq, pb_xqs, mb + ab + qblk + 2*kvblk, mb + ab + qblk + 2*kvblk + D*D/2, 0, D, lo, hi, pb_B) }
+	if t == 14 { ab := attn_off + l*attn_stride  matmul_q_batch(pb_xb2, D, pb_xq, pb_xqs, mb + ab + qblk + 2*kvblk, mb + ab + qblk + 2*kvblk + D*QD/2, 0, QD, lo, hi, pb_B) }
 	if t == 15 { fb := ffn_off + l*ffn_stride  matmul_q_batch(pb_hb, II, pb_xq, pb_xqs, mb + fb, mb + fb + II*D/2, 0, D, lo, hi, pb_B) }
 	if t == 16 { fb := ffn_off + l*ffn_stride  matmul_q_batch(pb_hb2, II, pb_xq, pb_xqs, mb + fb + gu, mb + fb + gu + II*D/2, 0, D, lo, hi, pb_B) }
 	if t == 17 { fb := ffn_off + l*ffn_stride  matmul_q_batch(pb_xb, D, pb_hq, pb_hqs, mb + fb + 2*gu, mb + fb + 2*gu + D*II/2, 0, II, lo, hi, pb_B) }
@@ -240,13 +242,13 @@ func do_job(j, att2) {
 		while u < hi {
 			b := u / NH
 			h := u % NH
-			attn_head_at(h, l, pb_tstart + b, pb_q + b*D*4, pb_xb + b*D*4, att2)
+			attn_head_at(h, l, pb_tstart + b, pb_q + b*QD*4, pb_xb + b*QD*4, att2)
 			u = u + 1
 		}
 	}
 	if t == 19 { nb := norms_off + l*qnorm_stride  b := lo  while b < hi { rmsnorm(pb_xb + b*D*4, pb_x + b*D*4, nb, D)  quantize_act(pb_xq + b*D, pb_xqs + b*(D/GS)*4, pb_xb + b*D*4, D)  b = b + 1 } }
 	if t == 20 { nb := norms_off + l*qnorm_stride + D*4  b := lo  while b < hi { rmsnorm(pb_xb + b*D*4, pb_x + b*D*4, nb, D)  quantize_act(pb_xq + b*D, pb_xqs + b*(D/GS)*4, pb_xb + b*D*4, D)  b = b + 1 } }
-	if t == 21 { b := lo  while b < hi { quantize_act(pb_xq + b*D, pb_xqs + b*(D/GS)*4, pb_xb + b*D*4, D)  b = b + 1 } }
+	if t == 21 { b := lo  while b < hi { quantize_act(pb_xq + b*QD, pb_xqs + b*(QD/GS)*4, pb_xb + b*QD*4, QD)  b = b + 1 } }
 	if t == 22 { b := lo  while b < hi { i := 0  while i < D { poke_f32(pb_x + b*D*4, i*4, peek_f32(pb_x + b*D*4, i*4) + peek_f32(pb_xb2 + b*D*4, i*4))  i = i + 1 }  b = b + 1 } }
 	if t == 23 {
 		b := lo
@@ -263,7 +265,7 @@ func do_job(j, att2) {
 		}
 	}
 	if t == 24 { b := lo  while b < hi { i := 0  while i < D { poke_f32(pb_x + b*D*4, i*4, peek_f32(pb_x + b*D*4, i*4) + peek_f32(pb_xb + b*D*4, i*4))  i = i + 1 }  b = b + 1 } }
-	if t == 25 { b := lo  while b < hi { rope_at(l, pb_tstart + b, pb_q + b*D*4)  b = b + 1 } }
+	if t == 25 { b := lo  while b < hi { rope_at(l, pb_tstart + b, pb_q + b*QD*4)  b = b + 1 } }
 	if t == 26 {   // batched tied lm_head, TRANSPOSED output spec_logits[i*B + b]: embed row read
 		nsc := D / GS   // once (hot in L1) + B contiguous writes per row (no scattered stride-VOCAB writes)
 		i := lo
@@ -509,13 +511,13 @@ func forward(tok, pos) (best) {
 		nb := norms_off + l*qnorm_stride
 		rmsnorm(hb, xx, nb, D)
 		ab := attn_off + l*attn_stride
-		matmul_q8(qb, mb + ab, mb + ab + D*D/2, 0, hb, D, D)
+		matmul_q8(qb, mb + ab, mb + ab + QD*D/2, 0, hb, QD, D)
 		matmul_q8(kb, mb + ab + qblk, mb + ab + qblk + KV*D/2, 0, hb, KV, D)
 		matmul_q8(vb, mb + ab + qblk + kvblk, mb + ab + qblk + kvblk + KV*D/2, 0, hb, KV, D)
 		qknorm(nb + 2*D*4)
 		rope_qk(pos)
 		attention(l, pos)
-		matmul_q8(hb, mb + ab + qblk + 2*kvblk, mb + ab + qblk + 2*kvblk + D*D/2, 0, attn, D, D)
+		matmul_q8(hb, mb + ab + qblk + 2*kvblk, mb + ab + qblk + 2*kvblk + D*QD/2, 0, attn, D, QD)
 		i = 0
 		while i < D { poke_f32(xx, i*4, peek_f32(xx, i*4) + peek_f32(hb, i*4))  i = i + 1 }
 		rmsnorm(hb, xx, nb + D*4, D)
@@ -558,7 +560,7 @@ func batch_layers(B) {
 	l := 0
 	while l < L {
 		dispatch_rows(19, l, 0, B)  barrier()
-		dispatch_rows(11, l, 0, D)  barrier()
+		dispatch_rows(11, l, 0, QD)  barrier()
 		dispatch_rows(12, l, 0, KV)  barrier()
 		dispatch_rows(13, l, 0, KV)  barrier()
 		dispatch_rows(25, l, 0, B)  barrier()

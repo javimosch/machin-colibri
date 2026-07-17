@@ -6,9 +6,14 @@ import json, os, sys, struct, numpy as np
 
 HF = sys.argv[1] if len(sys.argv) > 1 else "qwen-hf"
 OUT = sys.argv[2] if len(sys.argv) > 2 else "models/qwen3-q4.bin"
-D, NH, NKV, HD, I, L, VOCAB = 2048, 16, 8, 128, 6144, 28, 151936
-KV = NKV * HD
-SEQ, GS, THETA, MAGIC = 40960, 64, 1000000, 0x616B5133  # "akQ3"
+import os as _os
+_cfg = json.load(open(_os.path.join(HF, "config.json")))
+D = _cfg["hidden_size"]; NH = _cfg["num_attention_heads"]; NKV = _cfg["num_key_value_heads"]
+HD = _cfg.get("head_dim", D // NH); I = _cfg["intermediate_size"]; L = _cfg["num_hidden_layers"]
+VOCAB = _cfg["vocab_size"]; SEQ = min(_cfg.get("max_position_embeddings", 40960), 40960)
+THETA = int(_cfg.get("rope_theta", 1000000)); GS = 64; MAGIC = 0x616B5133
+KV = NKV * HD; QD = NH * HD   # attention inner dim (== D only when head_dim*heads == hidden)
+print(f"config: D={D} NH={NH} NKV={NKV} HD={HD} QD={QD} I={I} L={L} VOCAB={VOCAB} theta={THETA}")
 
 class ST:
     def __init__(self, hf):
@@ -59,7 +64,7 @@ def q4(w):
     return packed.reshape(out, inn // 2).tobytes(), scale.tobytes()
 
 os.makedirs(os.path.dirname(OUT) or ".", exist_ok=True)
-qblk = D*D//2 + 4*(D*D // GS)
+qblk = QD*D//2 + 4*(QD*D // GS)
 kvblk = KV*D//2 + 4*(KV*D // GS)
 attn_layer = 2*qblk + 2*kvblk           # q, k, v, o
 gu = I*D//2 + 4*(I*D // GS)
