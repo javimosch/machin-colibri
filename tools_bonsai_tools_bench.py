@@ -78,7 +78,7 @@ def openai_tools():
     for t in TOOLS:
         props, required = {}, []
         for pname, (ptype, req) in t["params"].items():
-            props[pname] = {"type": ptype, "description": f"{pname} ({ptype})"}
+            props[pname] = {"type": ptype}
             if req:
                 required.append(pname)
         schema = {"type": "object", "properties": props}
@@ -213,11 +213,11 @@ def cases():
     return cs
 
 
-def chat(base: str, user: str, max_tokens: int = 256) -> dict:
+def chat(base: str, user: str, max_tokens: int = 96) -> dict:
     body = {
         "model": "bonsai17-q2",
         "messages": [
-            {"role": "system", "content": "You are a tool-using assistant. Always call exactly one function when tools are available. Do not invent tool names."},
+            {"role": "system", "content": "Call exactly one tool."},
             {"role": "user", "content": user},
         ],
         "tools": openai_tools(),
@@ -232,7 +232,7 @@ def chat(base: str, user: str, max_tokens: int = 256) -> dict:
         method="POST",
     )
     t0 = time.time()
-    with urllib.request.urlopen(req, timeout=600) as resp:
+    with urllib.request.urlopen(req, timeout=1800) as resp:
         data = json.loads(resp.read().decode())
     return data, time.time() - t0
 
