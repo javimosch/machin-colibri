@@ -68,6 +68,19 @@ func json_str(s) (o) {
 }
 
 // build the deepseek/xLAM prompt from OpenAI messages (+ tools if present)
+// tool_choice:"required" forces a call by appending the start of a tool-call
+// object to the prompt, so the model must continue into a call. The prefix is
+// reconstructed onto the reply before find_tool_call parses it.
+var force_prefix = "{\"name\": \""
+
+func is_forced(body) (f) {
+	f = 0
+	tc, te := json_get(body, ".tool_choice")
+	if len(te) > 0 { return }
+	if json_str(tc) == "required" { f = 1 }
+	return
+}
+
 func build_prompt(body) (text) {
 	sys := "You are an AI assistant for function calling.For politically sensitive questions, security and privacy issues, and other non-computer science questions, you will refuse to answer\n"
 	r0, e0 := json_get(body, ".messages[0].role")
@@ -143,6 +156,7 @@ func find_tool_call(s) (found, name, argsj) {
 
 func handle_chat(reqbody) (res) {
 	text := build_prompt(reqbody)
+	if is_forced(reqbody) == 1 { text = text + force_prefix }
 	max_new := 256
 	mn, me := json_get(reqbody, ".max_tokens")
 	if len(me) == 0 { v := parse_int(mn)  if v > 0 { max_new = v } }
@@ -155,6 +169,7 @@ func handle_chat(reqbody) (res) {
 	mu_rel <- 1
 	last_req = now_ms()
 	reply := tok_decode(out)
+	if is_forced(reqbody) == 1 { reply = force_prefix + reply }
 	np := len(ids)
 	n := len(out)
 	found, tname, targs := find_tool_call(reply)

@@ -94,6 +94,19 @@ func norm_date(s) (out) {
 	return
 }
 
+// tool_choice:"required" forces a call by prefilling the assistant turn with the
+// start of a <tool_call> object, so the model cannot skip calling a tool. The
+// prefix is reconstructed onto the reply before find_tool_call parses it.
+var force_prefix = "<tool_call>\n{\"name\": \""
+
+func is_forced(body) (f) {
+	f = 0
+	tc, te := json_get(body, ".tool_choice")
+	if len(te) > 0 { return }
+	if json_str(tc) == "required" { f = 1 }
+	return
+}
+
 func build_prompt_ids(body) (ids) {
 	ids = []int{}
 	sys := "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."
@@ -143,6 +156,8 @@ func build_prompt_ids(body) (ids) {
 		ids = append(ids, 151668)
 		ids = append(ids, 271)
 	}
+	// tool_choice:"required" — prefill the tool-call opening so the model must call.
+	if is_forced(body) == 1 { ids = app_ids(ids, tok_encode_raw(force_prefix)) }
 	return
 }
 
@@ -229,6 +244,7 @@ func handle_chat(req) (res) {
 	last_req = now_ms()
 	mu_rel <- 1
 	reply := tok_decode(out)
+	if is_forced(body) == 1 { reply = force_prefix + reply }
 	n := len(out)
 	found, tname, targs := find_tool_call(reply)
 	callid := "call_" + str(np) + str(n)
