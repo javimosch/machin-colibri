@@ -34,8 +34,13 @@ class ST:
             self.shards["_"] = (np.memmap(p, dtype=np.uint8, mode="r"), hdr, 8+n)
             for k in hdr:
                 if k != "__metadata__": self.loc[k] = "_"
-    def has(self, name): return name in self.loc
+    def rn(self, name):
+        # this checkpoint stores names without the "model." wrapper prefix
+        if name not in self.loc and name.startswith("model.") and name[6:] in self.loc: return name[6:]
+        return name
+    def has(self, name): return self.rn(name) in self.loc
     def get(self, name):
+        name = self.rn(name)
         mm, hdr, base = self.shards[self.loc[name]]; h = hdr[name]
         s, e = h["data_offsets"]; raw = mm[base+s:base+e]
         if h["dtype"] == "BF16": arr = ((raw.view(np.uint16).astype(np.uint32)) << 16).view(np.float32)

@@ -45,6 +45,8 @@ class ST:
             for k in hdr:
                 if k != "__metadata__": self.loc[k] = "_"
     def get(self, name):
+        # this checkpoint stores names without the "model." wrapper prefix
+        if name not in self.loc and name.startswith("model.") and name[6:] in self.loc: name = name[6:]
         mm, hdr, base = self.shards[self.loc[name]]; h = hdr[name]
         s, e = h["data_offsets"]; raw = mm[base+s:base+e]
         if h["dtype"] == "BF16": arr = ((raw.view(np.uint16).astype(np.uint32)) << 16).view(np.float32)
@@ -91,7 +93,8 @@ def forward_last_hidden(ids):
 
 tk = Tokenizer.from_file(os.path.join(HF, "tokenizer.json"))
 text = TEXT if TASK is None else f"Instruct: {TASK}\nQuery:{TEXT}"
-ids = tk.encode(text).ids + [EOS]
+ids = tk.encode(text).ids            # post_processor already appends EOS <|endoftext|>
+if len(ids) == 0 or ids[-1] != EOS: ids = ids + [EOS]
 if IDS_ONLY:
     print(json.dumps({"ids": ids})); sys.exit(0)
 h = forward_last_hidden(ids)
