@@ -1,0 +1,92 @@
+// Qwen3-Embedding-0.6B CLI.
+// Build: machin encode qwen3e_engine.src qwen_tok.src qwen3e_cli.src > qwen3e.mfl
+//        machin build qwen3e.mfl -o qwen3e
+// Usage: qwen3e embed <model.bin> <text> [--dim N] [--instruct TASK] [--tok path]
+//          -> JSON {embedding:[...], dim, tokens, ms, ids:[...]}
+//        qwen3e bench <model.bin> <lines.txt> [--tok path]   (one text per line)
+// Semantics: encode text (query side: "Instruct: {task}\nQuery:{text}"), append
+// EOS <|endoftext|> 151643, last-token pool after final RMSNorm, L2-normalize;
+// --dim N = MRL truncation THEN re-normalize.
+
+var EOS_ID = 151643
+
+func text_to_ids(text, task) (ids) {
+	t := text
+	if len(task) > 0 { t = "Instruct: " + task + "\nQuery:" + text }
+	ids = tok_encode_raw(t)
+	ids = append(ids, EOS_ID)
+	return
+}
+
+func emb_json(dst, od, ntok, ms) (o) {
+	o = "{\"embedding\":["
+	i := 0
+	while i < od {
+		o = o + str(peek_f32(dst, i*4))
+		if i < od-1 { o = o + "," }
+		i = i + 1
+	}
+	o = o + "],\"dim\":" + str(od) + ",\"tokens\":" + str(ntok) + ",\"ms\":" + str(ms) + "}"
+	return
+}
+
+func main() {
+	a := args()
+	if len(a) < 4 { println("usage: qwen3e embed|bench <model.bin> <text|lines.txt> [--dim N] [--instruct TASK] [--tok path]")  exit(1) }
+	verb := a[1]
+	model := a[2]
+	arg3 := a[3]
+	dim := 0
+	task := ""
+	tokf := "models/qwen3e-tok.bin"
+	i := 4
+	while i < len(a) - 1 {
+		if a[i] == "--dim" { dim = parse_int(a[i+1])  i = i + 2  continue }
+		if a[i] == "--instruct" { task = a[i+1]  i = i + 2  continue }
+		if a[i] == "--tok" { tokf = a[i+1]  i = i + 2  continue }
+		i = i + 1
+	}
+	load_tok(tokf)
+	qwen3e_init(model)
+	dst := alloc(D*4)
+	if verb == "embed" {
+		ids := text_to_ids(arg3, task)
+		t0 := now_ms()
+		od := embed_ids(ids, len(ids), dst, dim)
+		ms := now_ms() - t0
+		o := emb_json(dst, od, len(ids), ms)
+		// drop closing brace, add ids for oracle cross-checks
+		o = substr(o, 0, len(o)-1) + ",\"ids\":["
+		k := 0
+		while k < len(ids) { o = o + str(ids[k])  if k < len(ids)-1 { o = o + "," }  k = k + 1 }
+		println(o + "]}")
+		flush()
+		return
+	}
+	if verb == "bench" {
+		b := read_file_bytes(arg3)
+		if len(b) == 0 { println("cannot read " + arg3)  exit(1) }
+		lines := split(bytes_str(b), "\n")
+		n := 0
+		toks := 0
+		t0 := now_ms()
+		i = 0
+		while i < len(lines) {
+			if len(lines[i]) > 0 {
+				ids := text_to_ids(lines[i], task)
+				embed_ids(ids, len(ids), dst, dim)
+				n = n + 1
+				toks = toks + len(ids)
+			}
+			i = i + 1
+		}
+		ms := now_ms() - t0
+		cps := float(n * 1000) / float(ms)
+		tps := float(toks * 1000) / float(ms)
+		println("{\"chunks\":" + str(n) + ",\"tokens\":" + str(toks) + ",\"ms\":" + str(ms) + ",\"chunks_per_s\":" + str(cps) + ",\"tok_per_s\":" + str(tps) + ",\"threads\":" + str(n_workers) + "}")
+		flush()
+		return
+	}
+	println("unknown verb: " + verb)
+	exit(1)
+}

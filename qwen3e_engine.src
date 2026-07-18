@@ -1,0 +1,525 @@
+// Pure-MFL Qwen3-Embedding-0.6B: causal Qwen3 trunk (GQA 16/8, per-head qk-norm,
+// rotate_half RoPE theta 1e6, SwiGLU, tied/int8 embed) with NO lm_head — the
+// output is the LAST token's hidden state after the final RMSNorm, L2-normalized.
+// KEY DELTA vs qwen3_engine.src: QD = NH*HD (2048) != D (1024): q_proj [QD,D],
+// o_proj [D,QD] — q/attn buffers are QD-sized, o has its own block size (oblk).
+// int8 Q8_0 matmuls + batched prefill + worker pool. Embedding-only: no decode,
+// no spec, no KV persistence; each call prefills from pos 0.
+
+var mb = 0
+var model_bytes = 0
+var D = 0
+var NH = 0
+var NKV = 0
+var HD = 0
+var II = 0
+var L = 0
+var VOCAB = 0
+var SEQ = 0
+var GS = 0
+var theta = 1000000
+var QD = 0
+var KV = 0
+var KVMUL = 0
+var HALF = 0
+var QDM = 0
+var qblk = 0
+var oblk = 0
+var kvblk = 0
+var attn_stride = 0
+var gu = 0
+var ffn_stride = 0
+var embed_off = 0
+var embed_soff = 0
+var norms_off = 0
+var qnorm_stride = 0
+var fnorm_off = 0
+var attn_off = 0
+var ffn_off = 0
+
+var xx = 0
+var hb = 0
+var qb = 0
+var kb = 0
+var vb = 0
+var attn = 0
+var ffn_out = 0
+var gbuf = 0
+var ubuf = 0
+var xqb = 0
+var xsb = 0
+var kcache = 0
+var vcache = 0
+var rinv = 0
+
+var n_workers = 1
+var jobs = make(chan int)
+var done = make(chan int)
+var pending = 0
+var gj_dst = 0
+var gj_wq = 0
+var gj_ws = 0
+var gj_n = 0
+
+var pb_tile = 256
+var pb_enabled = 1
+var pb_B = 0
+var pb_tstart = 0
+var pb_x = 0
+var pb_xb = 0
+var pb_xb2 = 0
+var pb_q = 0
+var pb_hb = 0
+var pb_hb2 = 0
+var pb_xq = 0
+var pb_xqs = 0
+var pb_hq = 0
+var pb_hqs = 0
+
+func load_qwen3e(path) {
+	m, sz := mmap_file(path)
+	mb = m
+	model_bytes = sz
+	if peek_i32(mb, 0) != 1634423109 { println("bad magic (want akQE)")  flush()  exit(1) }  // 0x616B5145
+	D = peek_i32(mb, 4)
+	NH = peek_i32(mb, 8)
+	NKV = peek_i32(mb, 12)
+	HD = peek_i32(mb, 16)
+	II = peek_i32(mb, 20)
+	L = peek_i32(mb, 24)
+	VOCAB = peek_i32(mb, 28)
+	SEQ = peek_i32(mb, 32)
+	GS = peek_i32(mb, 36)
+	theta = peek_i32(mb, 40)
+	QD = peek_i32(mb, 44)
+	embed_off = peek_i32(mb, 48)
+	norms_off = peek_i32(mb, 52)
+	fnorm_off = peek_i32(mb, 56)
+	attn_off = peek_i32(mb, 60)
+	ffn_off = peek_i32(mb, 64)
+	KV = NKV * HD
+	KVMUL = NH / NKV
+	HALF = HD / 2
+	QDM = QD
+	if D > QDM { QDM = D }
+	embed_soff = embed_off + VOCAB*D
+	qblk = QD*D + 4*((QD*D)/GS)
+	oblk = D*QD + 4*((D*QD)/GS)
+	kvblk = KV*D + 4*((KV*D)/GS)
+	attn_stride = qblk + oblk + 2*kvblk
+	gu = II*D + 4*((II*D)/GS)
+	ffn_stride = 3 * gu
+	qnorm_stride = (2*D + 2*HD) * 4   // in_ln, post_ln, q_norm[HD], k_norm[HD]
+}
+
+func alloc_qwen3e() {
+	xx = alloc(D*4)  hb = alloc(D*4)  qb = alloc(QD*4)  kb = alloc(KV*4)  vb = alloc(KV*4)
+	attn = alloc(QD*4)  ffn_out = alloc(D*4)
+	gbuf = alloc(II*4)  ubuf = alloc(II*4)
+	mx := QDM
+	if II > mx { mx = II }
+	xqb = alloc(mx)  xsb = alloc((mx/GS)*4)
+	kcache = alloc(L*SEQ*KV*4)  vcache = alloc(L*SEQ*KV*4)
+	rinv = alloc(HALF*4)
+	t := pb_tile
+	pb_x = alloc(t*D*4)  pb_xb = alloc(t*QDM*4)  pb_xb2 = alloc(t*D*4)  pb_q = alloc(t*QD*4)
+	pb_hb = alloc(t*II*4)  pb_hb2 = alloc(t*II*4)
+	pb_xq = alloc(t*QDM)  pb_xqs = alloc(t*(QDM/GS)*4)
+	pb_hq = alloc(t*II)  pb_hqs = alloc(t*(II/GS)*4)
+	lnth := log(float(theta))
+	i := 0
+	while i < HALF {
+		poke_f32(rinv, i*4, exp(0.0 - (float(i)/float(HALF)) * lnth))
+		i = i + 1
+	}
+}
+
+func rmsnorm(dst, src, woff, n) {
+	ss := 0.0
+	i := 0
+	while i < n { v := peek_f32(src, i*4)  ss = ss + v*v  i = i + 1 }
+	ss = 1.0 / sqrt(ss/float(n) + 0.000001)
+	i = 0
+	while i < n { poke_f32(dst, i*4, peek_f32(src, i*4) * ss * peek_f32(mb, woff + i*4))  i = i + 1 }
+}
+
+func rmsnorm_head(buf, woff, n) {
+	ss := 0.0
+	i := 0
+	while i < n { v := peek_f32(buf, i*4)  ss = ss + v*v  i = i + 1 }
+	ss = 1.0 / sqrt(ss/float(n) + 0.000001)
+	i = 0
+	while i < n { poke_f32(buf, i*4, peek_f32(buf, i*4) * ss * peek_f32(mb, woff + i*4))  i = i + 1 }
+}
+
+func quantize_act(xq, xs, x, n) {
+	ng := n / GS
+	g := 0
+	while g < ng {
+		base := g * GS
+		wmax := 0.0
+		i := 0
+		while i < GS { v := abs(peek_f32(x, (base+i)*4))  if v > wmax { wmax = v }  i = i + 1 }
+		scale := wmax / 127.0
+		poke_f32(xs, g*4, scale)
+		i = 0
+		while i < GS {
+			q := 0
+			if scale > 0.0 { q = int(round(peek_f32(x, (base+i)*4) / scale)) }
+			poke_u8(xq, base+i, q & 255)
+			i = i + 1
+		}
+		g = g + 1
+	}
+}
+
+func do_job(j, att2) {
+	t := j & 31
+	l := (j >> 5) & 255
+	pos := (j >> 13) & 4095
+	lo := (j >> 25) & 524287
+	hi := j >> 44
+	if t == 1 {   // single-token matmul rows
+		nsc := gj_n / GS
+		o := lo
+		while o < hi {
+			poke_f32(gj_dst, o*4, dot_q8(xqb, xsb, gj_wq + o*gj_n, gj_ws + o*nsc*4, gj_n, GS))
+			o = o + 1
+		}
+	}
+	if t == 3 {
+		h := lo
+		while h < hi { attn_head(l, pos, h, att2)  h = h + 1 }
+	}
+	// ---- batched prefill ----
+	if t == 11 { ab := attn_off + l*attn_stride  matmul_q8_batch(pb_q, QD, pb_xq, pb_xqs, mb + ab, mb + ab + QD*D, D, GS, pb_B, lo, hi) }
+	if t == 12 { ab := attn_off + l*attn_stride  matmul_q8_batch(kcache + (l*SEQ*KV + pb_tstart*KV)*4, KV, pb_xq, pb_xqs, mb + ab + qblk, mb + ab + qblk + KV*D, D, GS, pb_B, lo, hi) }
+	if t == 13 { ab := attn_off + l*attn_stride  matmul_q8_batch(vcache + (l*SEQ*KV + pb_tstart*KV)*4, KV, pb_xq, pb_xqs, mb + ab + qblk + kvblk, mb + ab + qblk + kvblk + KV*D, D, GS, pb_B, lo, hi) }
+	if t == 14 { ab := attn_off + l*attn_stride  ob := ab + qblk + 2*kvblk  matmul_q8_batch(pb_xb2, D, pb_xq, pb_xqs, mb + ob, mb + ob + D*QD, QD, GS, pb_B, lo, hi) }
+	if t == 15 { fb := ffn_off + l*ffn_stride  matmul_q8_batch(pb_hb, II, pb_xq, pb_xqs, mb + fb, mb + fb + II*D, D, GS, pb_B, lo, hi) }
+	if t == 16 { fb := ffn_off + l*ffn_stride  matmul_q8_batch(pb_hb2, II, pb_xq, pb_xqs, mb + fb + gu, mb + fb + gu + II*D, D, GS, pb_B, lo, hi) }
+	if t == 17 { fb := ffn_off + l*ffn_stride  matmul_q8_batch(pb_xb, D, pb_hq, pb_hqs, mb + fb + 2*gu, mb + fb + 2*gu + D*II, II, GS, pb_B, lo, hi) }
+	if t == 18 {
+		u := lo
+		while u < hi {
+			b := u / NH
+			h := u % NH
+			attn_head_at(h, l, pb_tstart + b, pb_q + b*QD*4, pb_xb + b*QD*4, att2)
+			u = u + 1
+		}
+	}
+	if t == 19 { nb := norms_off + l*qnorm_stride  b := lo  while b < hi { rmsnorm(pb_xb + b*D*4, pb_x + b*D*4, nb, D)  quantize_act(pb_xq + b*D, pb_xqs + b*(D/GS)*4, pb_xb + b*D*4, D)  b = b + 1 } }
+	if t == 20 { nb := norms_off + l*qnorm_stride + D*4  b := lo  while b < hi { rmsnorm(pb_xb + b*D*4, pb_x + b*D*4, nb, D)  quantize_act(pb_xq + b*D, pb_xqs + b*(D/GS)*4, pb_xb + b*D*4, D)  b = b + 1 } }
+	if t == 21 { b := lo  while b < hi { quantize_act(pb_xq + b*QD, pb_xqs + b*(QD/GS)*4, pb_xb + b*QD*4, QD)  b = b + 1 } }
+	if t == 22 { b := lo  while b < hi { i := 0  while i < D { poke_f32(pb_x + b*D*4, i*4, peek_f32(pb_x + b*D*4, i*4) + peek_f32(pb_xb2 + b*D*4, i*4))  i = i + 1 }  b = b + 1 } }
+	if t == 23 {
+		b := lo
+		while b < hi {
+			i := 0
+			while i < II {
+				v := peek_f32(pb_hb + b*II*4, i*4)
+				v = v / (1.0 + exp(0.0 - v))
+				poke_f32(pb_hb + b*II*4, i*4, v * peek_f32(pb_hb2 + b*II*4, i*4))
+				i = i + 1
+			}
+			quantize_act(pb_hq + b*II, pb_hqs + b*(II/GS)*4, pb_hb + b*II*4, II)
+			b = b + 1
+		}
+	}
+	if t == 24 { b := lo  while b < hi { i := 0  while i < D { poke_f32(pb_x + b*D*4, i*4, peek_f32(pb_x + b*D*4, i*4) + peek_f32(pb_xb + b*D*4, i*4))  i = i + 1 }  b = b + 1 } }
+	if t == 25 { b := lo  while b < hi { rope_at(l, pb_tstart + b, pb_q + b*QD*4)  b = b + 1 } }
+}
+
+func worker(jc, dc) {
+	att2 := alloc(SEQ * 4)
+	for j := range jc {
+		do_job(j, att2)
+		dc <- 1
+	}
+}
+
+func dispatch_rows(t, l, pos, d) {
+	nc := n_workers
+	if nc > d { nc = d }
+	chunk := (d + nc - 1) / nc
+	lo := 0
+	while lo < d {
+		hi := lo + chunk
+		if hi > d { hi = d }
+		if pending >= n_workers { <-done  pending = pending - 1 }
+		jobs <- (t | l << 5 | pos << 13 | lo << 25 | hi << 44)
+		pending = pending + 1
+		lo = hi
+	}
+}
+
+func barrier() {
+	while pending > 0 { <-done  pending = pending - 1 }
+}
+
+func matmul_q8s(dst, wq, ws, x, out, inn) {
+	quantize_act(xqb, xsb, x, inn)
+	gj_dst = dst  gj_wq = wq  gj_ws = ws  gj_n = inn
+	dispatch_rows(1, 0, 0, out)
+	barrier()
+}
+
+// GQA attention for (head, position): head h uses kv head h/KVMUL
+func attn_head(l, pos, h, att2) {
+	loff := l * SEQ * KV
+	kvh := (h / KVMUL) * HD
+	qh := qb + h*HD*4
+	t := 0
+	while t <= pos {
+		kt := kcache + (loff + t*KV + kvh)*4
+		poke_f32(att2, t*4, dot_f32(qh, kt, HD) / sqrt(float(HD)))
+		t = t + 1
+	}
+	softmax(att2, pos + 1)
+	ah := attn + h*HD*4
+	j := 0
+	while j < HD { poke_f32(ah, j*4, 0.0)  j = j + 1 }
+	t = 0
+	while t <= pos {
+		vt := vcache + (loff + t*KV + kvh)*4
+		axpy_f32(ah, peek_f32(att2, t*4), vt, HD)
+		t = t + 1
+	}
+}
+
+func attn_head_at(h, l, pos, qbase, obase, att2) {
+	loff := l * SEQ * KV
+	kvh := (h / KVMUL) * HD
+	qh := qbase + h*HD*4
+	t := 0
+	while t <= pos {
+		kt := kcache + (loff + t*KV + kvh)*4
+		poke_f32(att2, t*4, dot_f32(qh, kt, HD) / sqrt(float(HD)))
+		t = t + 1
+	}
+	softmax(att2, pos + 1)
+	xbh := obase + h*HD*4
+	j := 0
+	while j < HD { poke_f32(xbh, j*4, 0.0)  j = j + 1 }
+	t = 0
+	while t <= pos {
+		vt := vcache + (loff + t*KV + kvh)*4
+		axpy_f32(xbh, peek_f32(att2, t*4), vt, HD)
+		t = t + 1
+	}
+}
+
+func attention(l, pos) {
+	loff := l * SEQ * KV
+	kc := kcache + (loff + pos*KV)*4
+	vc := vcache + (loff + pos*KV)*4
+	i := 0
+	while i < KV { poke_f32(kc, i*4, peek_f32(kb, i*4))  poke_f32(vc, i*4, peek_f32(vb, i*4))  i = i + 1 }
+	dispatch_rows(3, l, pos, NH)
+	barrier()
+}
+
+// batched path: per-head qk-norm + rope for q (NH at qbase) + K in cache at pos
+func rope_at(l, pos, qbase) {
+	loff := l * SEQ * KV
+	kbase := kcache + (loff + pos*KV)*4
+	qnoff := norms_off + l*qnorm_stride + 2*D*4
+	h2 := 0
+	while h2 < NH { rmsnorm_head(qbase + h2*HD*4, qnoff, HD)  h2 = h2 + 1 }
+	h2 = 0
+	while h2 < NKV { rmsnorm_head(kbase + h2*HD*4, qnoff + HD*4, HD)  h2 = h2 + 1 }
+	sp := float(pos)
+	h := 0
+	while h < NH {
+		bb := h * HD
+		i := 0
+		while i < HALF {
+			ang := sp * peek_f32(rinv, i*4)
+			c := cos(ang)
+			s := sin(ang)
+			q0 := peek_f32(qbase, (bb+i)*4)
+			q1 := peek_f32(qbase, (bb+i+HALF)*4)
+			poke_f32(qbase, (bb+i)*4, q0*c - q1*s)
+			poke_f32(qbase, (bb+i+HALF)*4, q1*c + q0*s)
+			if h < NKV {
+				k0 := peek_f32(kbase, (bb+i)*4)
+				k1 := peek_f32(kbase, (bb+i+HALF)*4)
+				poke_f32(kbase, (bb+i)*4, k0*c - k1*s)
+				poke_f32(kbase, (bb+i+HALF)*4, k1*c + k0*s)
+			}
+			i = i + 1
+		}
+		h = h + 1
+	}
+}
+
+// single-token qk-norm + rope: q (NH) at qb, k (NKV) at kb — both pre-cache
+func qknorm_rope(l, pos) {
+	qnoff := norms_off + l*qnorm_stride + 2*D*4
+	h2 := 0
+	while h2 < NH { rmsnorm_head(qb + h2*HD*4, qnoff, HD)  h2 = h2 + 1 }
+	h2 = 0
+	while h2 < NKV { rmsnorm_head(kb + h2*HD*4, qnoff + HD*4, HD)  h2 = h2 + 1 }
+	sp := float(pos)
+	h := 0
+	while h < NH {
+		bb := h * HD
+		i := 0
+		while i < HALF {
+			ang := sp * peek_f32(rinv, i*4)
+			c := cos(ang)
+			s := sin(ang)
+			q0 := peek_f32(qb, (bb+i)*4)
+			q1 := peek_f32(qb, (bb+i+HALF)*4)
+			poke_f32(qb, (bb+i)*4, q0*c - q1*s)
+			poke_f32(qb, (bb+i+HALF)*4, q1*c + q0*s)
+			if h < NKV {
+				k0 := peek_f32(kb, (bb+i)*4)
+				k1 := peek_f32(kb, (bb+i+HALF)*4)
+				poke_f32(kb, (bb+i)*4, k0*c - k1*s)
+				poke_f32(kb, (bb+i+HALF)*4, k1*c + k0*s)
+			}
+			i = i + 1
+		}
+		h = h + 1
+	}
+}
+
+func softmax(p, n) {
+	mx := peek_f32(p, 0)
+	i := 1
+	while i < n { v := peek_f32(p, i*4)  if v > mx { mx = v }  i = i + 1 }
+	sm := 0.0
+	i = 0
+	while i < n { e := exp(peek_f32(p, i*4) - mx)  poke_f32(p, i*4, e)  sm = sm + e  i = i + 1 }
+	i = 0
+	while i < n { poke_f32(p, i*4, peek_f32(p, i*4) / sm)  i = i + 1 }
+}
+
+func ffn(l) {
+	fb := ffn_off + l*ffn_stride
+	matmul_q8s(gbuf, mb + fb, mb + fb + II*D, hb, II, D)
+	matmul_q8s(ubuf, mb + fb + gu, mb + fb + gu + II*D, hb, II, D)
+	i := 0
+	while i < II {
+		g := peek_f32(gbuf, i*4)
+		g = g / (1.0 + exp(0.0 - g))
+		poke_f32(gbuf, i*4, g * peek_f32(ubuf, i*4))
+		i = i + 1
+	}
+	matmul_q8s(ffn_out, mb + fb + 2*gu, mb + fb + 2*gu + D*II, gbuf, D, II)
+}
+
+func embed_row(token, dst) {
+	gsD := D / GS
+	i := 0
+	while i < D {
+		poke_f32(dst, i*4, float(peek_i8(mb, embed_off + token*D + i)) * peek_f32(mb, embed_soff + (token*gsD + i/GS)*4))
+		i = i + 1
+	}
+}
+
+// one causal step; hidden state accumulates in xx (no lm_head)
+func forward_hidden(tok, pos) {
+	embed_row(tok, xx)
+	i := 0
+	l := 0
+	while l < L {
+		nb := norms_off + l*qnorm_stride
+		rmsnorm(hb, xx, nb, D)
+		ab := attn_off + l*attn_stride
+		matmul_q8s(qb, mb + ab, mb + ab + QD*D, hb, QD, D)
+		matmul_q8s(kb, mb + ab + qblk, mb + ab + qblk + KV*D, hb, KV, D)
+		matmul_q8s(vb, mb + ab + qblk + kvblk, mb + ab + qblk + kvblk + KV*D, hb, KV, D)
+		qknorm_rope(l, pos)
+		attention(l, pos)
+		ob := ab + qblk + 2*kvblk
+		matmul_q8s(hb, mb + ob, mb + ob + D*QD, attn, D, QD)
+		i = 0
+		while i < D { poke_f32(xx, i*4, peek_f32(xx, i*4) + peek_f32(hb, i*4))  i = i + 1 }
+		rmsnorm(hb, xx, nb + D*4, D)
+		ffn(l)
+		i = 0
+		while i < D { poke_f32(xx, i*4, peek_f32(xx, i*4) + peek_f32(ffn_out, i*4))  i = i + 1 }
+		l = l + 1
+	}
+}
+
+func batch_layers(B) {
+	l := 0
+	while l < L {
+		dispatch_rows(19, l, 0, B)  barrier()
+		dispatch_rows(11, l, 0, QD)  barrier()
+		dispatch_rows(12, l, 0, KV)  barrier()
+		dispatch_rows(13, l, 0, KV)  barrier()
+		dispatch_rows(25, l, 0, B)  barrier()
+		dispatch_rows(18, l, 0, B * NH)  barrier()
+		dispatch_rows(21, l, 0, B)  barrier()
+		dispatch_rows(14, l, 0, D)  barrier()
+		dispatch_rows(22, l, 0, B)  barrier()
+		dispatch_rows(20, l, 0, B)  barrier()
+		dispatch_rows(15, l, 0, II)  barrier()
+		dispatch_rows(16, l, 0, II)  barrier()
+		dispatch_rows(23, l, 0, B)  barrier()
+		dispatch_rows(17, l, 0, D)  barrier()
+		dispatch_rows(24, l, 0, B)  barrier()
+		l = l + 1
+	}
+}
+
+func prefill_batch(prompt, np) {
+	ts := 0
+	while ts < np {
+		te := ts + pb_tile
+		if te > np { te = np }
+		B := te - ts
+		pb_B = B
+		pb_tstart = ts
+		b := 0
+		while b < B { embed_row(prompt[ts+b], pb_x + b*D*4)  b = b + 1 }
+		batch_layers(B)
+		if te == np {
+			i := 0
+			while i < D { poke_f32(xx, i*4, peek_f32(pb_x + (B-1)*D*4, i*4))  i = i + 1 }
+		}
+		ts = te
+	}
+}
+
+// embed token ids -> L2-normalized fp32 vector at dst (dim comps; MRL: truncate
+// then re-normalize). Returns the dim actually written.
+func embed_ids(ids, np, dst, dim) (od) {
+	od = D
+	if dim > 0 && dim < D { od = dim }
+	if np > SEQ { np = SEQ }
+	if np >= 16 && pb_enabled == 1 {
+		prefill_batch(ids, np)
+	} else {
+		pos := 0
+		while pos < np { forward_hidden(ids[pos], pos)  pos = pos + 1 }
+	}
+	rmsnorm(hb, xx, fnorm_off, D)   // final norm; hb = last token's hidden
+	ss := 0.0
+	i := 0
+	while i < od { v := peek_f32(hb, i*4)  ss = ss + v*v  i = i + 1 }
+	ss = sqrt(ss)
+	if ss == 0.0 { ss = 1.0 }
+	i = 0
+	while i < od { poke_f32(dst, i*4, peek_f32(hb, i*4) / ss)  i = i + 1 }
+	return
+}
+
+func qwen3e_init(path) {
+	tl := parse_int(env("COLIBRI_TILE"))
+	if tl > 0 { pb_tile = tl }
+	if parse_int(env("COLIBRI_NOBATCH")) == 1 { pb_enabled = 0 }
+	load_qwen3e(path)
+	cx := parse_int(env("COLIBRI_CTX"))    // KV cache cap; default 2048 (embedding chunks are small)
+	if cx < 1 { cx = 2048 }
+	if cx < SEQ { SEQ = cx }
+	alloc_qwen3e()
+	nw := parse_int(env("COLIBRI_THREADS"))
+	if nw > 0 { n_workers = nw } else { n_workers = 2 }
+	w := 0
+	while w < n_workers { go worker(jobs, done)  w = w + 1 }
+}

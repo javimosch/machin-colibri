@@ -1,0 +1,131 @@
+// Qwen3-Embedding-0.6B OpenAI-compatible embeddings server in pure MFL.
+// POST /v1/embeddings {model, input: string|[string], dimensions?, instruct?}
+//   -> {object:"list", data:[{object:"embedding", index, embedding:[...]}], model, usage}
+// Build: machin encode $MACHIN/framework/machweb.src qwen3e_engine.src qwen_tok.src serve_qwen3e.src > serve_qwen3e.mfl
+//        machin build serve_qwen3e.mfl -o serve_qwen3e
+// Run:   COLIBRI_THREADS=2 ./serve_qwen3e models/qwen3e-q8.bin 8095 models/qwen3e-tok.bin
+
+var model_id = "qwen3-embedding-0.6b"
+var EOS_ID = 151643
+var mu_acq = make(chan int)
+var mu_rel = make(chan int)
+
+func mutex_srv(acq, rel) {
+	while true {
+		acq <- 1
+		v := <-rel
+		if v < 0 { break }
+	}
+}
+
+func json_str2(s) (o) {
+	v := s
+	if len(v) >= 2 && has_prefix(v, "\"") && has_suffix(v, "\"") { v = substr(v, 1, len(v)-1) }
+	o = ""
+	b := bytes(v)
+	n := len(b)
+	i := 0
+	while i < n {
+		c := byte_at(b, i)
+		if c == 92 && i+1 < n {
+			d := byte_at(b, i+1)
+			if d == 110 { o = o + "\n"  i = i + 2  continue }
+			if d == 116 { o = o + "\t"  i = i + 2  continue }
+			if d == 114 { o = o + "\r"  i = i + 2  continue }
+			if d == 34 { o = o + "\""  i = i + 2  continue }
+			if d == 92 { o = o + "\\"  i = i + 2  continue }
+			if d == 47 { o = o + "/"  i = i + 2  continue }
+		}
+		o = o + bytes_str(bytes_sub(b, i, i+1))
+		i = i + 1
+	}
+	return
+}
+
+func embed_one(text, task, dim, dst) (od, ntok) {
+	t := text
+	if len(task) > 0 { t = "Instruct: " + task + "\nQuery:" + text }
+	ids := tok_encode_raw(t)
+	ids = append(ids, EOS_ID)
+	ntok = len(ids)
+	od = embed_ids(ids, ntok, dst, dim)
+	return
+}
+
+func vec_json(dst, od) (o) {
+	o = "["
+	i := 0
+	while i < od {
+		o = o + str(peek_f32(dst, i*4))
+		if i < od-1 { o = o + "," }
+		i = i + 1
+	}
+	o = o + "]"
+	return
+}
+
+func handle_embeddings(req) (res) {
+	body := req.body
+	dim := 0
+	dv, de := json_get(body, ".dimensions")
+	if len(de) == 0 { v := parse_int(dv)  if v > 0 { dim = v } }
+	task := ""
+	iv, ie := json_get(body, ".instruct")
+	if len(ie) == 0 { task = json_str2(iv) }
+	// input: array of strings, or a single string
+	texts := []string{}
+	i := 0
+	while i < 512 {
+		tv, te := json_get(body, ".input[" + str(i) + "]")
+		if len(te) > 0 { break }
+		texts = append(texts, json_str2(tv))
+		i = i + 1
+	}
+	if len(texts) == 0 {
+		sv, se := json_get(body, ".input")
+		if len(se) > 0 { res = ok_json("{\"error\":{\"message\":\"missing input\",\"type\":\"invalid_request_error\"}}")  return }
+		texts = append(texts, json_str2(sv))
+	}
+	dst := alloc(D*4)
+	g := <-mu_acq
+	data := ""
+	toks := 0
+	i = 0
+	while i < len(texts) {
+		od, nt := embed_one(texts[i], task, dim, dst)
+		toks = toks + nt
+		if i > 0 { data = data + "," }
+		data = data + "{\"object\":\"embedding\",\"index\":" + str(i) + ",\"embedding\":" + vec_json(dst, od) + "}"
+		i = i + 1
+	}
+	g = g
+	mu_rel <- 1
+	free(dst)
+	res = ok_json("{\"object\":\"list\",\"data\":[" + data + "],\"model\":\"" + model_id + "\",\"usage\":{\"prompt_tokens\":" + str(toks) + ",\"total_tokens\":" + str(toks) + "}}")
+	return
+}
+
+func api_route(req) (res) {
+	if req.method == "POST" && req.path == "/v1/embeddings" { res = handle_embeddings(req)  return }
+	if req.method == "GET" && req.path == "/v1/models" { res = ok_json("{\"object\":\"list\",\"data\":[{\"id\":\"" + model_id + "\",\"object\":\"model\",\"owned_by\":\"anvil\"}]}")  return }
+	if req.method == "GET" && req.path == "/health" { res = ok_json("{\"ok\":true,\"model\":\"" + model_id + "\",\"dim\":" + str(D) + "}")  return }
+	res = ok_json("{\"error\":{\"message\":\"not found\",\"type\":\"invalid_request_error\"}}")
+	return
+}
+
+func main() {
+	a := args()
+	path := "models/qwen3e-q8.bin"
+	port := 8095
+	tokf := "models/qwen3e-tok.bin"
+	if len(a) > 1 { path = a[1] }
+	if len(a) > 2 { port = parse_int(a[2]) }
+	if len(a) > 3 { tokf = a[3] }
+	t0 := now_ms()
+	qwen3e_init(path)
+	load_tok(tokf)
+	go mutex_srv(mu_acq, mu_rel)
+	println("qwen3e serve: " + model_id + " D=" + str(D) + " QD=" + str(QD) + " ctx=" + str(SEQ) + " loaded in " + str(now_ms()-t0) + " ms, " + str(n_workers) + " workers")
+	println("OpenAI embeddings API on http://0.0.0.0:" + str(port) + "/v1/embeddings")
+	serve(port, func(req) { return api_route(req) })
+}
