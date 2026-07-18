@@ -85,23 +85,33 @@ func build_prompt_ids(body) (ids) {
 		sys = json_str(c0)
 		first = 1
 	}
-	// tools -> append signatures + instruction to the system message
+	// tools -> collect the function specs as a JSON array
 	tools := ""
 	ti := 0
 	while ti < 32 {
 		fn, et := json_get(body, ".tools[" + str(ti) + "].function")
 		if len(et) > 0 { break }
-		if ti > 0 { tools = tools + "\n" }
+		if ti > 0 { tools = tools + ", " }
 		tools = tools + fn
 		ti = ti + 1
-	}
-	if len(tools) > 0 {
-		sys = sys + "\n\n# Tools\n\nYou may call functions. Return the call as JSON wrapped in <tool_call></tool_call>, e.g. <tool_call>{\"name\": <fn>, \"arguments\": <args>}</tool_call>.\n\nFunctions:\n" + tools
 	}
 	ids = append(ids, IM_START)
 	ids = app_ids(ids, tok_encode_raw("system\n" + sys))
 	ids = append(ids, IM_END)
 	ids = app_ids(ids, tok_encode_raw("\n"))
+	// Hammer/xLAM-2 tool format: tools go in a USER message (task-instruction + AVAILABLE_TOOLS +
+	// strict-JSON output instruction). These fc models are format-locked to this template; the
+	// generic Qwen <tool_call> prompt makes them emit an empty '[]'. find_tool_call parses the
+	// [{"name":..,"arguments":..}] array (or '[]' -> no call).
+	if len(tools) > 0 {
+		htask := "You are a tool calling assistant. In order to complete the user's request, you need to select one or more appropriate tools from the following tools and fill in the correct values for the tool parameters. Your specific tasks are:\n1. Make one or more function/tool calls to meet the request based on the question.\n2. If none of the function can be used, point it out and refuse to answer.\n3. If the given question lacks the parameters required by the function, also point it out."
+		hfmt := "The output MUST strictly adhere to the following JSON format, and NO other text MUST be included.\nThe example format is as follows. Please make sure the parameter type is correct. If no function call is needed, please directly output an empty list '[]'\n```\n[\n    {\"name\": \"func_name1\", \"arguments\": {\"argument1\": \"value1\"}}\n]\n```"
+		hu := "[BEGIN OF TASK INSTRUCTION]\n" + htask + "\n[END OF TASK INSTRUCTION]\n\n[BEGIN OF AVAILABLE_TOOLS]\n[" + tools + "]\n[END OF AVAILABLE_TOOLS]\n\n[BEGIN OF TASK INSTRUCTION]\n" + hfmt + "\n[END OF TASK INSTRUCTION]\n"
+		ids = append(ids, IM_START)
+		ids = app_ids(ids, tok_encode_raw("user\n" + hu))
+		ids = append(ids, IM_END)
+		ids = app_ids(ids, tok_encode_raw("\n"))
+	}
 	i := first
 	while i < 256 {
 		role, er := json_get(body, ".messages[" + str(i) + "].role")
