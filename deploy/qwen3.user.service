@@ -1,0 +1,15 @@
+[Unit]
+Description=anvil Qwen3-1.7B (40k, thinking) — pure MFL
+After=network.target
+[Service]
+Type=simple
+WorkingDirectory=/root/colibri
+Environment=COLIBRI_THREADS=14
+Environment=COLIBRI_IDLE=600
+Environment=COLIBRI_CTX=8192
+Environment=COLIBRI_NOTHINK=1
+ExecStart=/root/colibri/serve_qwen3 /root/colibri/qwen3-q8.bin 8094 /root/colibri/qwen3-tok.bin
+Restart=on-failure
+MemoryMax=7G
+[Install]
+WantedBy=multi-user.target

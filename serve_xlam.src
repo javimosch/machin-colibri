@@ -26,7 +26,7 @@ func idle_watchdog() {
 			if released == 0 && now_ms() - last_req > idle_ms {
 				madvise_free(mb, model_bytes)
 				released = 1
-				println("[colibri] idle -> released model pages")
+				println("[anvil] idle -> released model pages")
 				flush()
 			}
 			mu_rel <- 1
@@ -172,7 +172,7 @@ func handle_chat(reqbody) (res) {
 
 func api_route(req) (res) {
 	if req.method == "POST" && req.path == "/v1/chat/completions" { res = handle_chat(req.body)  return }
-	if req.method == "GET" && req.path == "/v1/models" { res = ok_json("{\"object\":\"list\",\"data\":[{\"id\":\"" + model_id + "\",\"object\":\"model\",\"owned_by\":\"colibri\"}]}")  return }
+	if req.method == "GET" && req.path == "/v1/models" { res = ok_json("{\"object\":\"list\",\"data\":[{\"id\":\"" + model_id + "\",\"object\":\"model\",\"owned_by\":\"anvil\"}]}")  return }
 	if req.method == "GET" && req.path == "/health" { res = ok_json("{\"ok\":true,\"model\":\"" + model_id + "\"}")  return }
 	res = ok_json("{\"error\":{\"message\":\"not found\",\"type\":\"invalid_request_error\"}}")
 	return

@@ -1,13 +1,13 @@
 [Unit]
-Description=colibri xLAM — pure-MFL OpenAI server (xLAM-1b-fc-r, function-calling)
+Description=anvil xLAM — pure-MFL OpenAI server (xLAM-1b-fc-r, function-calling)
 After=network.target
 
 [Service]
 Type=simple
-WorkingDirectory=/home/jarancibia/ai/machin-colibri
+WorkingDirectory=/home/jarancibia/ai/machin-anvil
 Environment=COLIBRI_THREADS=8
 Environment=COLIBRI_IDLE=300
-ExecStart=/home/jarancibia/ai/machin-colibri/serve_xlam /home/jarancibia/ai/machin-colibri/models/xlam-q8.bin 8092 /home/jarancibia/ai/machin-colibri/models/xlam-tok.bin
+ExecStart=/home/jarancibia/ai/machin-anvil/serve_xlam /home/jarancibia/ai/machin-anvil/models/xlam-q8.bin 8092 /home/jarancibia/ai/machin-anvil/models/xlam-tok.bin
 Restart=on-failure
 RestartSec=5
 

@@ -1,5 +1,5 @@
 [Unit]
-Description=colibri OLMoE — pure-MFL OpenAI server (OLMoE-1B-7B MoE)
+Description=anvil OLMoE — pure-MFL OpenAI server (OLMoE-1B-7B MoE)
 After=network.target
 
 [Service]

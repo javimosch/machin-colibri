@@ -1,12 +1,12 @@
-# 🐦 machin-colibri
+# ⚒️ machin-anvil
 
-**A real LLM, in a language you've never heard of.** Run **Llama-3.2-1B-Instruct** on a laptop CPU at **20+ tokens/sec** — written in **pure [machin](https://github.com/javimosch/machin)** (MFL, a machine-first language), with **zero dependencies**: no BLAS, no llama.cpp, no PyTorch, no Python at runtime. One static binary. And it decodes **4× faster than the reference C** (`llama2.c`'s `runq`) it is verified token-for-token against.
+**A real LLM — and the agent that runs on it — forged from scratch, in a language you've never heard of.** Run **Llama-3.2-1B-Instruct** (and Qwen2.5/3, xLAM, a 7B-class MoE) on a CPU you already own at **20+ tokens/sec** — written in **pure [machin](https://github.com/javimosch/machin)** (MFL, a machine-first language), with **zero dependencies**: no BLAS, no llama.cpp, no PyTorch, no Python at runtime. One static binary. It decodes **4× faster than the reference C** (`llama2.c`'s `runq`) it is verified token-for-token against — and it's fast enough to **back a real coding agent, self-hosted, with no cloud.**
 
-Inspired by [JustVugg/colibri](https://github.com/JustVugg/colibri) — *tiny engine, immense model*, a 744B MoE streamed onto 25 GB of RAM. Same philosophy (one small engine, quantized weights, brutally honest numbers), aimed at the **opposite corner** of the design space: **small models, as fast as the silicon allows, on hardware you already own.**
+> **Renamed from `machin-colibri` (2026-07).** This project began inspired by [JustVugg/colibri](https://github.com/JustVugg/colibri) — *tiny engine, immense model* — and borrowed its philosophy: one small engine, quantized weights, brutally honest numbers. It has since grown into its own thing: a from-scratch, zero-dependency runtime for a whole **family** of small models that now **serves agentic/coding workloads on your own hardware**. Hence **anvil** — forged in MFL, no libraries, and the anvil under the coding models it serves. The colibri lineage is kept, gratefully; the name reflects what it became.
 
 ```
-$ colibri chat models/llama32-1b-q80.bin
-  🐦 colibri — Llama-3.2-1B-Instruct · int8 · pure MFL · 0 deps
+$ anvil chat models/llama32-1b-q80.bin
+  ⚒️ anvil — Llama-3.2-1B-Instruct · int8 · pure MFL · 0 deps
   ✓ loaded in 43ms (mmap)  ·  10 threads
   › what is the capital of France?
   ◆ Paris. The Eiffel Tower is located in Paris. The Louvre Museum is also there.
@@ -15,7 +15,7 @@ $ colibri chat models/llama32-1b-q80.bin
 
 ## Why this exists
 
-Everyone runs LLMs in C++/CUDA/Python. This one is written **entirely in a language most people have never heard of**, to answer a concrete question: *how fast can a real transformer go with a from-scratch engine and no numeric libraries at all?* The answer, on a weak CPU: **right up against the hardware roofline** — within ~7% of an optimal hand-tuned C GEMM, and 4× faster than the canonical reference C implementation.
+Everyone runs LLMs in C++/CUDA/Python. This one is written **entirely in a language most people have never heard of**, to answer a concrete question: *how fast can a real transformer go with a from-scratch engine and no numeric libraries at all — and what can you build on it?* The answer, on a weak CPU: **right up against the hardware roofline** (within ~7% of an optimal hand-tuned C GEMM, 4× faster than the canonical reference C) — fast enough to serve a self-hosted coding agent.
 
 No `libtorch`. No `ggml`. No `-lopenblas`. The int8/int4 matmul kernels, the KV cache, the tokenizer (both SentencePiece **and** a from-scratch tiktoken/BPE), the RoPE tables, the worker pool, the OpenAI-compatible HTTP server — all of it is MFL, compiled to a single native binary.
 
@@ -27,8 +27,17 @@ No `libtorch`. No `ggml`. No `-lopenblas`. The int8/int4 matmul kernels, the KV 
 - **Prefix cache across requests** — a repeated system prompt goes **37 s → 0.8 s** (46×).
 - **int4 support** — halves the model to 695 MB, stays coherent.
 - **OpenAI-compatible server** — `/v1/chat/completions`, streaming (SSE), tool/function-calling, seeds. Drop-in for any OpenAI client.
-- **Llama-3.2** (tiktoken BPE) **and** TinyLlama (SentencePiece), both in pure MFL.
+- **A whole family of models** — Llama-3.2, Qwen2.5-1.5B (32k), Qwen3-1.7B (thinking), xLAM-1b (function-calling), OLMoE-1B-7B (MoE) — all pure MFL.
+- **Backs a self-hosted coding agent** — a measured, zero-cloud edit→run→verify loop (below).
 - **Verified, honest, reproducible** — every speedup has a certification doc; every dead end is written down.
+
+> **Config note:** runtime env knobs (thread count, idle release, context cap, …) currently use the `COLIBRI_*` prefix for historical reasons; `ANVIL_*` aliases are planned. The examples below use the working names.
+
+## Forged for agents on your own hardware
+
+The point of a fast, zero-dependency, OpenAI-compatible runtime is what it lets you *self-host*. anvil serves tool-calling models (Qwen2.5-Coder- / xLAM-class) that drive real agentic loops with **no cloud, no API key, no data leaving the box**.
+
+In a measured spike, the **[tau](https://github.com/javimosch/tau)** coding agent — itself a from-scratch OpenAI-compatible client — drove a **Hammer (Qwen2.5-Coder-1.5B)** model *served by anvil* through a full **edit → run → verify** loop: given a bounded coding task, the model emitted a `write` tool call, tau executed it, ran the result with `bash`, and confirmed the output. **3/3 completions, ~17 s each, entirely on a 6-core CPU box** — pure MFL from the compiler, through the tokenizer and int8 inference, to the tool loop. The engine is done; the interesting frontier now is the *agent* it enables.
 
 ## The idea
 
@@ -42,7 +51,7 @@ A dense transformer's decode speed is set by one number: **bytes moved per token
 
 The result is an engine that is **already at the roofline**. What that means, and where it can't go further, is written up honestly in **[docs/PERFORMANCE-FRONTIER.md](docs/PERFORMANCE-FRONTIER.md)** — including every technique that *should* have helped and didn't (speculative decoding, gate sparsity, early-exit, continuous batching), each with the measurement that killed it.
 
-## Honest numbers (rbm21 — Intel i5-13400T, 14 threads, DDR4)
+## Honest numbers (rbm21 — Intel i5-13400T, DDR4)
 
 | metric | value |
 |---|---|
@@ -56,7 +65,7 @@ The result is an engine that is **already at the roofline**. What that means, an
 
 This is not a frontier model. It is a **real instruction-tuned LLM answering correctly, fast, with an engine that has no right to be this small** — and a map of exactly where the hardware wall is.
 
-## Benchmarks (measured — rbm21: Intel i5-13400T, 14 threads, AVX-VNNI, DDR4)
+## Benchmarks (measured — rbm21: Intel i5-13400T, AVX-VNNI, DDR4)
 
 All pure MFL, int8, no dependencies. Numbers are real, on a cool box (not thermally throttled).
 
@@ -89,15 +98,15 @@ Every model above is **token-identical to its fp32 numpy reference** (int8 quant
 
 ```bash
 # 1) build the machin compiler (once) — see github.com/javimosch/machin
-# 2) convert a model to the colibri int8 format (HF -> ak44):
+# 2) convert a model to the anvil int8 format (HF -> ak44):
 python3 tools_export_l3.py unsloth/Llama-3.2-1B-Instruct models/llama32-1b-q80.bin
 
 # 3) compile the CLI (pure MFL -> C -> native binary):
-machin encode engine.src cli.src > colibri.mfl
-machin build colibri.mfl -o colibri
+machin encode engine.src cli.src > anvil.mfl
+machin build anvil.mfl -o anvil
 
 # 4) chat:
-COLIBRI_THREADS=10 ./colibri chat models/llama32-1b-q80.bin
+COLIBRI_THREADS=10 ./anvil chat models/llama32-1b-q80.bin
 ```
 
 ### Run it as an OpenAI-compatible server
@@ -105,8 +114,8 @@ COLIBRI_THREADS=10 ./colibri chat models/llama32-1b-q80.bin
 ```bash
 # machweb is machin's std HTTP framework (ships with the machin repo)
 machin encode $MACHIN/framework/machweb.src engine.src serve.src > serve.mfl
-machin build serve.mfl -o colibri-serve
-COLIBRI_THREADS=10 ./colibri-serve models/llama32-1b-q80.bin 8090
+machin build serve.mfl -o anvil-serve
+COLIBRI_THREADS=10 ./anvil-serve models/llama32-1b-q80.bin 8090
 
 # then point any OpenAI client at http://localhost:8090/v1
 curl -s localhost:8090/v1/chat/completions -d '{
@@ -175,25 +184,28 @@ And **Qwen3-1.7B** — the newer generation, **40k context**, **thinking-capable
 adds **per-head qk-norm** (reused from the OLMoE engine) to the same GQA + tied-embed
 engine. 12.7 tok/s on rbm21. See [certs/M10-qwen3.md](certs/M10-qwen3.md).
 
-## Also: a function-calling agent model (xLAM-1b-fc-r)
+## Also: function-calling agent models (xLAM-1b-fc-r, Qwen2.5-Coder / "Hammer")
 
 The same engine family runs **[xLAM-1b-fc-r](certs/M8-xlam.md)** — a 1B
 function-calling-specialized model (deepseek/Llama arch) in pure MFL,
-token-identical to fp32, **1.62 GB** on disk. Its OpenAI server does real tool
-calls (`"weather in Tokyo?"` → `get_weather({"city":"Tokyo"})`), with the deepseek
-byte-level BPE tokenizer written in MFL too. **Batched prefill + a single-slot KV
-prefix cache** make multi-turn agentic clients practical: a repeated system prompt
-goes **20.7 s → 2.0 s** (91× on the cache). Honest note: batched prefill itself is
-only ~1.3× on this compute-balanced CPU (the [balanced-roofline wall](docs/PERFORMANCE-FRONTIER.md)
-applies to prefill too) — the prefix cache is what carries the multi-turn win.
+token-identical to fp32, **1.62 GB** on disk — and **Hammer** (Qwen2.5-Coder-1.5B,
+a tool-calling specialist), which is the model behind the self-hosted coding-agent
+loop above. Their OpenAI servers do real tool calls (`"weather in Tokyo?"` →
+`get_weather({"city":"Tokyo"})`), with byte-level BPE tokenizers written in MFL too.
+**Batched prefill + a single-slot KV prefix cache** make multi-turn agentic clients
+practical: a repeated system prompt goes **20.7 s → 2.0 s** (91× on the cache).
+Honest note: batched prefill itself is only ~1.3× on this compute-balanced CPU (the
+[balanced-roofline wall](docs/PERFORMANCE-FRONTIER.md) applies to prefill too) — the
+prefix cache is what carries the multi-turn win.
 
 ## Related
 
 - **[machin](https://github.com/javimosch/machin)** — the machine-first language this is written in. The int8/int4 kernel builtins (`dot_q8`, `dot_q4`, `dot_f32`, `axpy_f32`, `mmap_file`) were contributed upstream from this project.
-- **[JustVugg/colibri](https://github.com/JustVugg/colibri)** — the streaming-MoE engine that inspired the name and the next milestone.
+- **[tau](https://github.com/javimosch/tau)** — the from-scratch OpenAI-compatible coding agent that anvil serves in the self-hosted loop above.
+- **[JustVugg/colibri](https://github.com/JustVugg/colibri)** — the streaming-MoE engine that inspired this project's origin and its name-until-2026.
 - **[docs/PERFORMANCE-FRONTIER.md](docs/PERFORMANCE-FRONTIER.md)** — the honest map of the wall.
 - Certifications: **[M5 (Llama-3.2)](certs/M5-llama32.md)** · **[M6 (tools + systemd)](certs/M6-tools.md)**
 
 ---
 
-*Pure MFL. Zero dependencies. One binary. Verified against the reference, token for token.*
+*Pure MFL. Zero dependencies. One binary. Forged from scratch, verified against the reference, token for token.*

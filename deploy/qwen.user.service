@@ -1,12 +1,12 @@
 [Unit]
-Description=colibri Qwen — pure-MFL OpenAI server (Qwen2.5-1.5B-Instruct, 32k ctx, streaming)
+Description=anvil Qwen — pure-MFL OpenAI server (Qwen2.5-1.5B-Instruct, 32k ctx, streaming)
 After=network.target
 [Service]
 Type=simple
-WorkingDirectory=/home/jarancibia/ai/machin-colibri
+WorkingDirectory=/home/jarancibia/ai/machin-anvil
 Environment=COLIBRI_THREADS=8
 Environment=COLIBRI_IDLE=300
-ExecStart=/home/jarancibia/ai/machin-colibri/serve_qwen /home/jarancibia/ai/machin-colibri/models/qwen-q8.bin 8093 /home/jarancibia/ai/machin-colibri/models/qwen-tok.bin
+ExecStart=/home/jarancibia/ai/machin-anvil/serve_qwen /home/jarancibia/ai/machin-anvil/models/qwen-q8.bin 8093 /home/jarancibia/ai/machin-anvil/models/qwen-tok.bin
 Restart=on-failure
 RestartSec=5
 [Install]
