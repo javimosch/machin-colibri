@@ -40,3 +40,7 @@ qwen3e.mfl
 qwen3e
 serve_qwen3e.mfl
 serve_qwen3e
+bonsai17_cli
+bonsai17_cli.mfl
+serve_bonsai17
+serve_bonsai17.mfl
