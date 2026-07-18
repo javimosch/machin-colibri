@@ -5,7 +5,7 @@ import json, struct, sys
 
 TK = sys.argv[1] if len(sys.argv) > 1 else "olmoe-hf/tokenizer.json"
 OUT = sys.argv[2] if len(sys.argv) > 2 else "models/olmoe-tok.bin"
-VOCAB_SIZE = 151936
+VOCAB_SIZE = int(sys.argv[3]) if len(sys.argv) > 3 else 151936
 MAGIC = 0x71544B31  # "qTK1"
 
 tk = json.load(open(TK))["model"]
