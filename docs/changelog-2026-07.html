@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Changelog July 2026 - machin-anvil</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+    <style>
+      body { font-family: 'Geist', system-ui, sans-serif; background-color: #050505; color: #e2e8f0; }
+      h1, h2, h3 { font-family: 'Geist', system-ui, sans-serif; }
+      .tab-btn { transition: all 0.2s ease; }
+      .tab-btn.active { background-color: #1a1a1d; border-color: #3b82f6; color: #fff; }
+      .tab-content { display: none; animation: fadeIn 0.3s ease; }
+      .tab-content.active { display: block; }
+      @keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
+      .feature-card { background: linear-gradient(135deg, #1a1a1d 0%, #151517 100%); border: 1px solid #262629; transition: all 0.3s ease; }
+      .feature-card:hover { border-color: #3b82f6; transform: translateY(-2px); }
+    </style>
+  </head>
+  <body class="bg-[#0a0a0b] min-h-screen">
+    <div class="max-w-5xl mx-auto px-6 py-24">
+      <header class="mb-16">
+        <a href="changelog.html" class="inline-flex items-center gap-1 text-sm text-white/30 hover:text-white/70 text-sm mb-6 inline-block transition-colors"><span class="text-xs">&larr; Back tolarr;</span> Back to Changelog <span class="text-[10px]">→</span></a>
+        <h1 class="text-5xl font-bold text-white mt-4 tracking-tight">Changelog</h1>
+        <p class="text-white/40 mt-3 text-lg">July 2026</p>
+        
+        <!-- Tabs -->
+        <div class="flex gap-2 mt-8">
+          <button onclick="switchTab('product')" id="tab-product" class="tab-btn active px-5 py-2.5 rounded-lg border border-slate-700 text-slate-300 font-medium text-sm hover:border-slate-600">
+            Product
+          </button>
+          <button onclick="switchTab('technical')" id="tab-technical" class="tab-btn px-5 py-2.5 rounded-lg border border-slate-700 text-slate-300 font-medium text-sm hover:border-slate-600">
+            Technical
+          </button>
+        </div>
+      </header>
+
+      <!-- Product Changelog -->
+      <div id="content-product" class="tab-content active">
+        <div class="feature-card rounded-xl p-6">
+          <div class="flex items-start gap-4">
+            <div class="w-12 h-12 rounded-lg bg-amber-500/10 flex items-center justify-center flex-shrink-0">
+              <span class="text-2xl">⚒️</span>
+            </div>
+            <div>
+              <h3 class="text-xl font-semibold text-white mb-2">Anvil is born</h3>
+              <p class="text-white/40 leading-relaxed">Renamed from machin-colibri to machin-anvil: a pure-MFL LLM runtime with zero runtime deps, OpenAI-compatible serving, and honest certifications — built to host coding agents on cheap CPUs.</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="feature-card rounded-xl p-6">
+          <div class="flex items-start gap-4">
+            <div class="w-12 h-12 rounded-lg bg-blue-500/10 flex items-center justify-center flex-shrink-0">
+              <span class="text-2xl">🚀</span>
+            </div>
+            <div>
+              <h3 class="text-xl font-semibold text-white mb-2">Agentic model family</h3>
+              <p class="text-white/40 leading-relaxed">Llama-3.2-1B (~21 tok/s), xLAM-1b function-calling, Qwen2.5/Qwen3 with streaming + tools, Q4 VNNI (~19.6 tok/s), and Ternary-Bonsai-1.7B Q2 with a 12/12 tool-selection bench over 20 tools.</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="feature-card rounded-xl p-6">
+          <div class="flex items-start gap-4">
+            <div class="w-12 h-12 rounded-lg bg-emerald-500/10 flex items-center justify-center flex-shrink-0">
+              <span class="text-2xl">🧰</span>
+            </div>
+            <div>
+              <h3 class="text-xl font-semibold text-white mb-2">Tool calling that agents can use</h3>
+              <p class="text-white/40 leading-relaxed"><code>tool_choice: "required"</code>, prefix cache for multi-turn system prompts, SSE streaming, and forced-prefix decoding so clients like pi/tau get real <code>tool_calls</code> instead of prose.</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="feature-card rounded-xl p-6">
+          <div class="flex items-start gap-4">
+            <div class="w-12 h-12 rounded-lg bg-purple-500/10 flex items-center justify-center flex-shrink-0">
+              <span class="text-2xl">📦</span>
+            </div>
+            <div>
+              <h3 class="text-xl font-semibold text-white mb-2">Smaller footprints, same honesty</h3>
+              <p class="text-white/40 leading-relaxed">Int4 Qwen3 (half size), ternary Bonsai (~462 MB), embeddings (Qwen3-Embedding-0.6B with parity cert), idle madvise release, and KV warm/persist so restarts skip the cold prefill tax.</p>
+            </div>
+          </div>
+        </div>
+
+      </div>
+
+      <!-- Technical Changelog -->
+      <div id="content-technical" class="tab-content">
+        <div class="space-y-8">
+
+        <section>
+          <h2 class="text-2xl font-semibold text-brand-400 mb-4 flex items-center gap-2">
+            <span>🚀</span> Features
+          </h2>
+          <ul class="space-y-2 text-slate-300">
+            <li><span class="text-slate-500 text-sm mr-3">[18/07]</span>feat(bonsai): Ternary-Bonsai-1.7B Q2_0 engine, converters, and agent repro docs</li>
+            <li><span class="text-slate-500 text-sm mr-3">[18/07]</span>feat(qwen3e): parity certification harness (cosine gate + pairwise ranking agreement)</li>
+            <li><span class="text-slate-500 text-sm mr-3">[18/07]</span>feat(qwen3e): Qwen3-Embedding-0.6B engine variant (QD=NH*HD != D), converter, numpy oracle, CLI, /v1/embeddings server</li>
+            <li><span class="text-slate-500 text-sm mr-3">[18/07]</span>feat(serve): tool_choice:"required" in serve_qwen3 + serve_xlam</li>
+            <li><span class="text-slate-500 text-sm mr-3">[18/07]</span>feat(serve): tool_choice:"required" via forced-prefix decoding</li>
+            <li><span class="text-slate-500 text-sm mr-3">[18/07]</span>feat(serve_qwen): Hammer/xLAM-2 tool format (AVAILABLE_TOOLS user msg + strict JSON)</li>
+            <li><span class="text-slate-500 text-sm mr-3">[18/07]</span>feat(convert): config-driven Qwen2.5 converter + tokenizer vocab arg</li>
+            <li><span class="text-slate-500 text-sm mr-3">[17/07]</span>feat(q4): generalize engine + converter for QD=NH*HD (non-square attn) + config-driven dims</li>
+            <li><span class="text-slate-500 text-sm mr-3">[17/07]</span>feat(int4): Q4 Qwen3-1.7B + VNNI dot_q4 — 1.5x decode, 2.2x with spec, half size</li>
+            <li><span class="text-slate-500 text-sm mr-3">[17/07]</span>feat(engine): speculative decoding (prompt-lookup, greedy) — COLIBRI_SPEC</li>
+            <li><span class="text-slate-500 text-sm mr-3">[17/07]</span>feat: persist warmed KV to disk (COLIBRI_KVSTORE) — restart skips the boot warm</li>
+            <li><span class="text-slate-500 text-sm mr-3">[17/07]</span>feat: warm() + COLIBRI_WARM — preload a fixed system prompt's KV at boot</li>
+            <li><span class="text-slate-500 text-sm mr-3">[17/07]</span>feat: COLIBRI_NOTHINK server flag for Qwen3 (skip thinking traces for pi)</li>
+            <li><span class="text-slate-500 text-sm mr-3">[17/07]</span>feat(M10): Qwen3-1.7B — GQA + per-head qk-norm + 40k ctx, thinking-capable</li>
+            <li><span class="text-slate-500 text-sm mr-3">[17/07]</span>feat(M9): Qwen2.5-1.5B-Instruct at 32k in pure MFL + SSE STREAMING (fixes pi)</li>
+            <li><span class="text-slate-500 text-sm mr-3">[16/07]</span>feat(M8): batched prefill + KV prefix cache for xLAM — makes pi practical</li>
+            <li><span class="text-slate-500 text-sm mr-3">[16/07]</span>feat(M8): xLAM-1b-fc-r — agentic/function-calling model in pure MFL</li>
+            <li><span class="text-slate-500 text-sm mr-3">[16/07]</span>feat: idle model release — madvise(DONTNEED) after inactivity (4GB->27MB)</li>
+            <li><span class="text-slate-500 text-sm mr-3">[16/07]</span>feat(M7 lever3): OpenAI server + pure-MFL OLMoE tokenizer — end-to-end</li>
+            <li><span class="text-slate-500 text-sm mr-3">[16/07]</span>feat(M7 lever2): int8 lm_head — 9.4 -> 14.5 tok/s, still token-identical</li>
+            <li><span class="text-slate-500 text-sm mr-3">[16/07]</span>feat(M7 lever1): int4 experts — half footprint (4.74GB), token-identical</li>
+            <li><span class="text-slate-500 text-sm mr-3">[16/07]</span>feat(M7): OLMoE-1B-7B in pure MFL — 7B-class MoE, token-identical to fp32, streamed</li>
+            <li><span class="text-slate-500 text-sm mr-3">[16/07]</span>feat(M7 spike): pure-MFL MoE + expert streaming — token-identical, zero download</li>
+            <li><span class="text-slate-500 text-sm mr-3">[12/07]</span>feat: continuous batching primitive (cb_step) — exact, ~1.35x on rbm21</li>
+            <li><span class="text-slate-500 text-sm mr-3">[12/07]</span>feat: int4 (ak45) support + low-spec inference frontier analysis + exploration levers</li>
+            <li><span class="text-slate-500 text-sm mr-3">[11/07]</span>feat: skills mechanism (opt-in) + honest negative eval</li>
+            <li><span class="text-slate-500 text-sm mr-3">[11/07]</span>feat(M6): server-side tool calling (OpenAI tools) + systemd unit</li>
+            <li><span class="text-slate-500 text-sm mr-3">[11/07]</span>feat(M5): Llama-3.2-1B-Instruct — pure-MFL tiktoken + v4 checkpoints (RoPE theta/llama3 scaling)</li>
+            <li><span class="text-slate-500 text-sm mr-3">[11/07]</span>feat(M3): colibri-serve — OpenAI-compatible inference server in pure MFL</li>
+            <li><span class="text-slate-500 text-sm mr-3">[11/07]</span>feat(M2): worker-pool parallel matmul + dot_i8 kernels + int4/v3 path — 21.8 tok/s cold (TH=6)</li>
+            <li><span class="text-slate-500 text-sm mr-3">[11/07]</span>feat(M1): int8/Q8_0 engine colibri_q — v2 checkpoints, GQA, BPE prompt encoding</li>
+            <li><span class="text-slate-500 text-sm mr-3">[11/07]</span>feat(M0): pure-MFL fp32 llama2.c-format inference — token-exact vs run.c over 200 greedy tokens on stories15M</li>
+          </ul>
+        </section>
+
+        <section>
+          <h2 class="text-2xl font-semibold text-red-400 mb-4 flex items-center gap-2">
+            <span>🐛</span> Bug Fixes
+          </h2>
+          <ul class="space-y-2 text-slate-300">
+            <li><span class="text-slate-500 text-sm mr-3">[18/07]</span>fix(qwen3e): handle unprefixed tensor names; don't double-append EOS (HF post_processor already adds <</li>
+            <li><span class="text-slate-500 text-sm mr-3">[17/07]</span>fix(serve_qwen3): normalize pi's per-request date -> conversation caches</li>
+            <li><span class="text-slate-500 text-sm mr-3">[11/07]</span>fix: prefix cache persistence across requests (was arena-freed)</li>
+          </ul>
+        </section>
+
+        <section>
+          <h2 class="text-2xl font-semibold text-emerald-400 mb-4 flex items-center gap-2">
+            <span>📚</span> Documentation
+          </h2>
+          <ul class="space-y-2 text-slate-300">
+            <li><span class="text-slate-500 text-sm mr-3">[17/07]</span>docs(M15): Q4 quality investigation — layers are the gap, not lm_head</li>
+            <li><span class="text-slate-500 text-sm mr-3">[17/07]</span>docs(M13): AVX-VNNI kernel + the 2x compounding (spec+VNNI = 1.98x)</li>
+            <li><span class="text-slate-500 text-sm mr-3">[17/07]</span>docs(M11): decode perf anatomy — memory-latency-bound, not barrier-bound</li>
+            <li><span class="text-slate-500 text-sm mr-3">[17/07]</span>docs: benchmarks in README (rbm21) + Qwen3 COLIBRI_CTX cap + M10 cert</li>
+            <li><span class="text-slate-500 text-sm mr-3">[16/07]</span>docs: finish the README (was a 4-line stub) + frontier MoE-streaming escape hatch</li>
+            <li><span class="text-slate-500 text-sm mr-3">[11/07]</span>docs(M4): glue certs — tau (via TAU_ENDPOINT, tau#64) and roam (stock --api-base) both drive colibri-serve end-to-end</li>
+            <li><span class="text-slate-500 text-sm mr-3">[11/07]</span>docs: links to machin, awesome-machin, blog post</li>
+            <li><span class="text-slate-500 text-sm mr-3">[11/07]</span>docs(M2): final numbers — 21.8 tok/s cold burst / 19.0 sustained (laptop TH=6), 17.9 contended rbm21; challenge hit for interactive bursts</li>
+            <li><span class="text-slate-500 text-sm mr-3">[11/07]</span>docs(M1): TinyLlama-1.1B verified — argmax-identical to runq.c over 48 positions, 2.1 tok/s single-thread (beats scalar C reference at 1.67)</li>
+          </ul>
+        </section>
+
+        <section>
+          <h2 class="text-2xl font-semibold text-white/40 mb-4 flex items-center gap-2">
+            <span>⚡</span> Performance
+          </h2>
+          <ul class="space-y-2 text-slate-300">
+            <li><span class="text-slate-500 text-sm mr-3">[17/07]</span>perf(qwen): use matmul_q8_batch builtin for prefill (2x); rbm21 deploy notes</li>
+            <li><span class="text-slate-500 text-sm mr-3">[12/07]</span>perf: use dot_q8 for the Q8_0 matmul inner loop (decode + batched prefill)</li>
+            <li><span class="text-slate-500 text-sm mr-3">[12/07]</span>perf: batched prefill + precomputed RoPE freq table</li>
+            <li><span class="text-slate-500 text-sm mr-3">[11/07]</span>perf: mmap the checkpoint + build tokenizer vocab in a local slice</li>
+          </ul>
+        </section>
+
+        <section>
+          <h2 class="text-2xl font-semibold text-white/40 mb-4 flex items-center gap-2">
+            <span>⚙️</span> Miscellaneous Tasks
+          </h2>
+          <ul class="space-y-2 text-slate-300">
+            <li><span class="text-slate-500 text-sm mr-3">[16/07]</span>chore: add user-level systemd unit (local deploy, no root)</li>
+            <li><span class="text-slate-500 text-sm mr-3">[16/07]</span>chore: gitignore __pycache__</li>
+            <li><span class="text-slate-500 text-sm mr-3">[12/07]</span>chore: gitignore cb build artifacts</li>
+          </ul>
+        </section>
+
+        <section>
+          <h2 class="text-2xl font-semibold text-purple-400 mb-4 flex items-center gap-2">
+            <span>💼</span> Other
+          </h2>
+          <ul class="space-y-2 text-slate-300">
+            <li><span class="text-slate-500 text-sm mr-3">[19/07]</span>Merge pull request #1 from javimosch/embed-spike</li>
+            <li><span class="text-slate-500 text-sm mr-3">[19/07]</span>cert(bonsai): tool-calling bench 12/12 with 20-tool catalog</li>
+            <li><span class="text-slate-500 text-sm mr-3">[18/07]</span>cert(qwen3e): EMBED-PARITY — 10/10 texts cosine >= 0.9979 vs fp32 oracle, 357/360 pairwise ranking agreement, 2-thread throughput + serve smoke</li>
+            <li><span class="text-slate-500 text-sm mr-3">[18/07]</span>rebrand: machin-colibri -> machin-anvil</li>
+          </ul>
+        </section>
+        </div>
+      </div>
+    </div>
+
+    <script>
+      function switchTab(tab) {
+        document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
+        document.querySelectorAll('.tab-btn').forEach(el => el.classList.remove('active'));
+        document.getElementById('content-' + tab).classList.add('active');
+        document.getElementById('tab-' + tab).classList.add('active');
+      }
+    </script>
+  </body>
+</html>

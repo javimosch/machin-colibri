@@ -51,6 +51,8 @@ A dense transformer's decode speed is set by one number: **bytes moved per token
 
 The result is an engine that is **already at the roofline**. What that means, and where it can't go further, is written up honestly in **[docs/PERFORMANCE-FRONTIER.md](docs/PERFORMANCE-FRONTIER.md)** — including every technique that *should* have helped and didn't (speculative decoding, gate sparsity, early-exit, continuous batching), each with the measurement that killed it.
 
+**Docs site** (GitHub Pages): project home, roadmap to a stable OSS pair of agentic models at >20 tok/s on cheap hardware, and monthly changelog — [javimosch.github.io/machin-anvil](https://javimosch.github.io/machin-anvil/). Roadmap: [`docs/ROADMAP.md`](docs/ROADMAP.md).
+
 ## Honest numbers (rbm21 — Intel i5-13400T, DDR4)
 
 | metric | value |
