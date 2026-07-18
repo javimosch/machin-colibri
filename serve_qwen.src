@@ -5,6 +5,10 @@
 var model_id = "qwen2.5-1.5b-instruct"
 var IM_START = 151644
 var IM_END = 151645
+// tool_choice:"required" forces a call by prefilling the assistant turn with the
+// start of a tool-call object, so the model cannot emit an empty '[]'. The prefix
+// is reconstructed onto the reply before find_tool_call parses it.
+var force_prefix = "[\n    {\"name\": \""
 var mu_acq = make(chan int)
 var mu_rel = make(chan int)
 var last_req = 0
@@ -75,6 +79,14 @@ func app_ids(dst, src) (out) {
 }
 
 // build the ChatML token sequence from OpenAI messages (+ tools)
+func is_forced(body) (f) {
+	f = 0
+	tc, te := json_get(body, ".tool_choice")
+	if len(te) > 0 { return }
+	if json_str(tc) == "required" { f = 1 }
+	return
+}
+
 func build_prompt_ids(body) (ids) {
 	ids = []int{}
 	sys := "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."
@@ -128,6 +140,8 @@ func build_prompt_ids(body) (ids) {
 	}
 	ids = append(ids, IM_START)
 	ids = app_ids(ids, tok_encode_raw("assistant\n"))
+	// tool_choice:"required" — prefill the tool-call opening so '[]' is impossible.
+	if is_forced(body) == 1 { ids = app_ids(ids, tok_encode_raw(force_prefix)) }
 	return
 }
 
@@ -207,6 +221,7 @@ func handle_chat(req) (res) {
 	last_req = now_ms()
 	mu_rel <- 1
 	reply := tok_decode(out)
+	if is_forced(body) == 1 { reply = force_prefix + reply }
 	n := len(out)
 	found, tname, targs := find_tool_call(reply)
 	callid := "call_" + str(np) + str(n)
