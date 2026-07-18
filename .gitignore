@@ -35,3 +35,8 @@ qwen3_cli
 serve_qwen3.mfl
 serve_qwen3
 qwen3-hf/
+qwen3-embed-hf/
+qwen3e.mfl
+qwen3e
+serve_qwen3e.mfl
+serve_qwen3e
